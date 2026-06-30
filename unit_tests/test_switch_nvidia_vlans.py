@@ -39,15 +39,27 @@ def interfaces_bridge() -> dict:
 
 def test_vlan_membership_from_interfaces(switch_config: NetworkSwitchConfig, interfaces_bridge: dict) -> None:
     switch = NvidiaCumulusSwitch(switch_config)
-    switch._interfaces_config_cache = interfaces_bridge
+    switch._interfaces_applied_cache = interfaces_bridge
     membership = switch._vlan_membership_by_id()
 
     assert membership["10"] == ["swp1", "swp2"]
     assert membership["20"] == ["swp2", "swp3"]
 
 
+def test_refresh_clears_caches(switch_config: NetworkSwitchConfig, interfaces_bridge: dict) -> None:
+    switch = NvidiaCumulusSwitch(switch_config)
+    switch._interfaces_config_cache = interfaces_bridge
+    switch._interfaces_applied_cache = interfaces_bridge
+
+    switch.refresh()
+
+    assert switch._interfaces_config_cache is None
+    assert switch._interfaces_applied_cache is None
+
+
 def test_parse_vlans(switch_config: NetworkSwitchConfig, vlan_configs: dict, interfaces_bridge: dict) -> None:
     switch = NvidiaCumulusSwitch(switch_config)
+    switch._interfaces_applied_cache = interfaces_bridge
     switch._interfaces_config_cache = interfaces_bridge
     vlans = switch._parse_vlans(vlan_configs, switch._vlan_membership_by_id())
 
@@ -66,19 +78,25 @@ def test_vlans_api_calls(
 ) -> None:
     vlan_response = MagicMock(status_code=200)
     vlan_response.json.return_value = vlan_configs
-    if_response = MagicMock(status_code=200)
-    if_response.json.return_value = interfaces_bridge
-    mock_get.side_effect = [vlan_response, if_response]
+    applied_response = MagicMock(status_code=200)
+    applied_response.json.return_value = interfaces_bridge
+    oper_response = MagicMock(status_code=200)
+    oper_response.json.return_value = interfaces_bridge
+    # 1) bridge VLANs, 2) applied interfaces (membership), 3) operational interfaces (port details)
+    mock_get.side_effect = [vlan_response, applied_response, oper_response]
 
     switch = NvidiaCumulusSwitch(switch_config)
     vlans = switch.vlans
 
     assert len(vlans) == 3
-    assert mock_get.call_count == 2
+    assert mock_get.call_count == 3
     urls = [call.args[0] for call in mock_get.call_args_list]
     assert urls[0] == f"https://10.0.0.1:8765/nvue_v1{BRIDGE_DOMAIN_VLANS_PATH}"
     assert urls[1] == "https://10.0.0.1:8765/nvue_v1/interface"
+    assert urls[2] == "https://10.0.0.1:8765/nvue_v1/interface"
     assert mock_get.call_args_list[0].kwargs["params"] is None
+    assert mock_get.call_args_list[1].kwargs["params"] == {"rev": "applied"}
+    assert mock_get.call_args_list[2].kwargs["params"] is None
 
 
 @patch("production_test_framework.switch.nvidia.nvidia_cumulus_switch.requests.get")

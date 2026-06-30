@@ -39,6 +39,7 @@ class NvidiaCumulusSwitch(NetworkSwitch):
         self._api_root = "/nvue_v1"
         self._base_url = f"https://{config.host}:{config.port}{self._api_root}"
         self._interfaces_config_cache: dict[str, Any] | None = None
+        self._interfaces_applied_cache: dict[str, Any] | None = None
 
     @property
     def status(self) -> NetworkSwitchStatus:
@@ -59,6 +60,7 @@ class NvidiaCumulusSwitch(NetworkSwitch):
     @property
     def vlans(self) -> list[Vlan]:
         """Configured VLANs on the bridge domain (OpenAPI operationId: getBridgeDomainVlans)."""
+        self.refresh()
         vlan_configs = self._run_api_call(BRIDGE_DOMAIN_VLANS_PATH)
         membership = self._vlan_membership_by_id()
         return self._parse_vlans(vlan_configs, membership)
@@ -73,21 +75,34 @@ class NvidiaCumulusSwitch(NetworkSwitch):
 
     def vlan(self, vlan_id: str) -> Vlan:
         """Single VLAN with member ports (OpenAPI operationId: getBridgeDomainVlan)."""
+        self.refresh()
         vlan_configs = self._run_api_call(BRIDGE_DOMAIN_VLANS_PATH)
         if vlan_id not in vlan_configs:
             raise SwitchAPIError(f"VLAN {vlan_id} not found on bridge domain {BRIDGE_DOMAIN}")
         membership = self._vlan_membership_by_id()
         return self._parse_vlan(vlan_id, membership.get(vlan_id, []))
 
+    def refresh(self) -> None:
+        """Drop cached interface data so the next read re-fetches from the switch."""
+        self._interfaces_config_cache = None
+        self._interfaces_applied_cache = None
+
     def _interfaces_config(self) -> dict[str, Any]:
+        """Operational interface state (oper-status, stats)."""
         if self._interfaces_config_cache is None:
             self._interfaces_config_cache = self._run_api_call(INTERFACES_PATH)
         return self._interfaces_config_cache
 
+    def _interfaces_applied_config(self) -> dict[str, Any]:
+        """Applied interface config carries bridge VLAN assignment."""
+        if self._interfaces_applied_cache is None:
+            self._interfaces_applied_cache = self._run_api_call(INTERFACES_PATH, params={"rev": "applied"})
+        return self._interfaces_applied_cache
+
     def _vlan_membership_by_id(self) -> dict[str, list[str]]:
         """Map VLAN ID to interface names assigned on the configured bridge domain."""
         membership: dict[str, list[str]] = {}
-        for interface_id, body in self._interfaces_config().items():
+        for interface_id, body in self._interfaces_applied_config().items():
             if not isinstance(body, dict):
                 continue
             for vid in self._interface_vlan_ids(body, BRIDGE_DOMAIN):
