@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: FSL-1.1-ALv2
 # Copyright (c) 2025 Delos Data, Inc.
 
-"""NVIDIA Spectrum switch driver via Cumulus Linux NVUE (read-only)."""
+"""NVIDIA Spectrum switch driver via Cumulus Linux NVUE."""
 
 import logging
+import time
 from typing import Any
 
 import requests
+from requests.adapters import HTTPAdapter
 from requests.auth import HTTPBasicAuth
+from urllib3.util.retry import Retry
 
 from production_test_framework.switch.exceptions import SwitchAPIError
 from production_test_framework.switch.models import NetworkSwitchConfig, NetworkSwitchStatus, Port, Vlan
@@ -18,8 +21,12 @@ from production_test_framework.switch.nvidia.nvue_paths import (
     FIRMWARE_PATH,
     INTERFACES_PATH,
     PLATFORM_PATH,
+    REVISION_PATH,
     SYSTEM_PATH,
+    bridge_domain_vlan_path,
+    interface_bridge_vlan_path,
     interface_path,
+    revision_path,
 )
 from production_test_framework.switch.port_sort import port_id_sort_key
 
@@ -28,9 +35,19 @@ requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.
 # OpenAPI getInterfaces view=description: admin-status, oper-status, description
 VIEW_DESCRIPTION = "description"
 
+# NVUE applies config changes asynchronously once a changeset is applied.
+_APPLY_TIMEOUT_S = 60.0
+_APPLY_INTERVAL_S = 1.0
+
+_APPLIED_STATES = frozenset({"applied", "applied_and_saved"})
+_APPLY_ERROR_STATES = frozenset({"apply_error", "invalid", "rejected"})
+
+_CONNECT_RETRIES = 5
+_RETRY_BACKOFF_S = 0.3
+
 
 class NvidiaCumulusSwitch(NetworkSwitch):
-    """Read-only NVUE client for Cumulus Linux (e.g. Spectrum-5610)."""
+    """NVUE client for Cumulus Linux (e.g. Spectrum-5610)."""
 
     def __init__(self, config: NetworkSwitchConfig) -> None:
         super().__init__(config)
@@ -40,6 +57,15 @@ class NvidiaCumulusSwitch(NetworkSwitch):
         self._base_url = f"https://{config.host}:{config.port}{self._api_root}"
         self._interfaces_config_cache: dict[str, Any] | None = None
         self._interfaces_applied_cache: dict[str, Any] | None = None
+        self._session = requests.Session()
+        adapter = HTTPAdapter(
+            max_retries=Retry(
+                total=_CONNECT_RETRIES,
+                connect=_CONNECT_RETRIES,
+                backoff_factor=_RETRY_BACKOFF_S,
+            )
+        )
+        self._session.mount("https://", adapter)
 
     @property
     def status(self) -> NetworkSwitchStatus:
@@ -66,11 +92,8 @@ class NvidiaCumulusSwitch(NetworkSwitch):
         return self._parse_vlans(vlan_configs, membership)
 
     def port(self, port_id: str) -> Port:
-        """Single interface (OpenAPI operationId: getInterface, view=description)."""
-        interface = self._run_api_call(
-            interface_path(port_id),
-            params={"view": VIEW_DESCRIPTION},
-        )
+        """Single interface (OpenAPI operationId: getInterface)."""
+        interface = self._run_api_call(interface_path(port_id))
         return self._parse_port(port_id, interface)
 
     def vlan(self, vlan_id: str) -> Vlan:
@@ -82,10 +105,75 @@ class NvidiaCumulusSwitch(NetworkSwitch):
         membership = self._vlan_membership_by_id()
         return self._parse_vlan(vlan_id, membership.get(vlan_id, []))
 
+    def set_port_admin_state(self, port_id: str, up: bool) -> None:
+        """Administratively enable (up=True) or disable (up=False) a port"""
+        state = "up" if up else "down"
+        revision_id = self._create_revision()
+        self._run_api_write(
+            "PATCH",
+            interface_path(port_id),
+            params={"rev": revision_id},
+            json_body={"link": {"state": {state: {}}}},
+        )
+        self._apply_revision(revision_id)
+        self.refresh()
+
+    def delete_vlan(self, vlan_id: str) -> None:
+        """Remove a VLAN from the bridge domain and from every member interface.
+
+        Membership is carried per-interface, so the VLAN is unset both on the
+        bridge domain VLAN list and on each interface that references it, in a
+        single changeset.
+        """
+        self.refresh()
+        member_ports = self._vlan_membership_by_id().get(vlan_id, [])
+        revision_id = self._create_revision()
+        for port_id in member_ports:
+            self._run_api_write(
+                "DELETE",
+                interface_bridge_vlan_path(port_id, vlan_id),
+                params={"rev": revision_id},
+            )
+        self._run_api_write(
+            "DELETE",
+            bridge_domain_vlan_path(vlan_id),
+            params={"rev": revision_id},
+        )
+        self._apply_revision(revision_id)
+        self.refresh()
+
     def refresh(self) -> None:
         """Drop cached interface data so the next read re-fetches from the switch."""
         self._interfaces_config_cache = None
         self._interfaces_applied_cache = None
+
+    def _create_revision(self) -> str:
+        """Create a new changeset and return its id (POST /revision)."""
+        body = self._run_api_write("POST", REVISION_PATH)
+        if not isinstance(body, dict) or not body:
+            raise SwitchAPIError(f"unexpected NVUE revision response: {body!r}")
+        return next(iter(body))
+
+    def _apply_revision(self, revision_id: str) -> None:
+        """Apply a changeset and block until NVUE reports it applied."""
+        self._run_api_write(
+            "PATCH",
+            revision_path(revision_id),
+            json_body={"state": "apply", "auto-prompt": {"ays": "ays_yes"}},
+        )
+        deadline = time.monotonic() + _APPLY_TIMEOUT_S
+        while True:
+            body = self._run_api_call(revision_path(revision_id))
+            state = body.get("state") if isinstance(body, dict) else None
+            if state in _APPLIED_STATES:
+                return
+            if state in _APPLY_ERROR_STATES:
+                raise SwitchAPIError(f"NVUE revision {revision_id} failed to apply: state={state!r}")
+            if time.monotonic() >= deadline:
+                raise SwitchAPIError(
+                    f"NVUE revision {revision_id} not applied within {_APPLY_TIMEOUT_S}s (state={state!r})"
+                )
+            time.sleep(_APPLY_INTERVAL_S)
 
     def _interfaces_config(self) -> dict[str, Any]:
         """Operational interface state (oper-status, stats)."""
@@ -153,7 +241,7 @@ class NvidiaCumulusSwitch(NetworkSwitch):
         request_params = dict(params) if params else None
 
         self._logger.debug(f"NVUE GET {path} params={request_params}")
-        response = requests.get(
+        response = self._session.get(
             url,
             auth=basic,
             params=request_params,
@@ -168,6 +256,36 @@ class NvidiaCumulusSwitch(NetworkSwitch):
         result = response.json()
         if not isinstance(result, dict):
             raise SwitchAPIError(f"unexpected NVUE response type for {path}: {type(result).__name__}")
+        self._logger.debug(f"NVUE response: {result}")
+        return result
+
+    def _run_api_write(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> Any:
+        url = f"{self._base_url}{path}"
+        basic = HTTPBasicAuth(self._config.username, self._config.password)
+        request_params = dict(params) if params else None
+
+        self._logger.debug(f"NVUE {method} {path} params={request_params} body={json_body}")
+        response = self._session.request(
+            method,
+            url,
+            auth=basic,
+            params=request_params,
+            json=json_body,
+            verify=self._config.verify_tls,
+            timeout=30,
+        )
+
+        if response.status_code not in (200, 201, 204):
+            self._logger.error(f"API call failed: {response.status_code} {response.text}")
+            raise SwitchAPIError(f"API call failed: {response.status_code} {response.text}")
+
+        result = response.json() if response.content else None
         self._logger.debug(f"NVUE response: {result}")
         return result
 

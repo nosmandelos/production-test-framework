@@ -69,7 +69,7 @@ def test_parse_vlans(switch_config: NetworkSwitchConfig, vlan_configs: dict, int
     assert vlan10.ports[0].description == "server-1"
 
 
-@patch("production_test_framework.switch.nvidia.nvidia_cumulus_switch.requests.get")
+@patch("production_test_framework.switch.nvidia.nvidia_cumulus_switch.requests.Session.get")
 def test_vlans_api_calls(
     mock_get: MagicMock,
     switch_config: NetworkSwitchConfig,
@@ -99,7 +99,7 @@ def test_vlans_api_calls(
     assert mock_get.call_args_list[2].kwargs["params"] is None
 
 
-@patch("production_test_framework.switch.nvidia.nvidia_cumulus_switch.requests.get")
+@patch("production_test_framework.switch.nvidia.nvidia_cumulus_switch.requests.Session.get")
 def test_vlan_missing_raises(
     mock_get: MagicMock,
     switch_config: NetworkSwitchConfig,

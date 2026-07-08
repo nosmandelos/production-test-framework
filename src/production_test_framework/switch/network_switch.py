@@ -37,3 +37,13 @@ class NetworkSwitch(ABC):
     def vlan(self, vlan_id: str) -> Vlan:
         """Get configuration for a vlan of the switch."""
         ...
+
+    @abstractmethod
+    def set_port_admin_state(self, port_id: str, up: bool) -> None:
+        """Administratively enable (up=True) or disable (up=False) a port."""
+        ...
+
+    @abstractmethod
+    def delete_vlan(self, vlan_id: str) -> None:
+        """Remove a VLAN from the bridge domain and from every member interface."""
+        ...
