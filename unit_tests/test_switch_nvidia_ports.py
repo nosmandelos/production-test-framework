@@ -50,7 +50,7 @@ def test_parse_ports_from_fixture(interfaces_payload: dict) -> None:
     assert lo.oper_up is None
 
 
-@patch("production_test_framework.switch.nvidia.nvidia_cumulus_switch.requests.get")
+@patch("production_test_framework.switch.nvidia.nvidia_cumulus_switch.requests.Session.get")
 def test_ports_calls_get_interfaces(
     mock_get: MagicMock,
     switch_config: NetworkSwitchConfig,
@@ -71,7 +71,7 @@ def test_ports_calls_get_interfaces(
     assert mock_get.call_args.args[0] == f"https://10.0.0.1:8765/nvue_v1{INTERFACES_PATH}"
 
 
-@patch("production_test_framework.switch.nvidia.nvidia_cumulus_switch.requests.get")
+@patch("production_test_framework.switch.nvidia.nvidia_cumulus_switch.requests.Session.get")
 def test_port_calls_get_interface(
     mock_get: MagicMock,
     switch_config: NetworkSwitchConfig,
@@ -88,4 +88,5 @@ def test_port_calls_get_interface(
     assert port.id == "swp1"
     assert port.description == "server-1"
     assert mock_get.call_args.args[0] == f"https://10.0.0.1:8765/nvue_v1{interface_path('swp1')}"
-    assert mock_get.call_args.kwargs["params"] == {"view": VIEW_DESCRIPTION}
+    # port() fetches the full interface, no view filter
+    assert mock_get.call_args.kwargs["params"] is None
