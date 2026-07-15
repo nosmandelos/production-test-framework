@@ -6,7 +6,12 @@
 import socket
 from unittest.mock import MagicMock, patch
 
-from production_test_framework.ssh import CommandResult, SSHExecutor
+from production_test_framework.ssh import (
+    CommandResult,
+    SSHExecutor,
+    check_ssh_password_login,
+    wait_for_ssh_password_login,
+)
 
 
 class TestCommandResult:
@@ -205,3 +210,83 @@ class TestSSHExecutor:
         mock_client.close.assert_called_once()
         assert executor._client is None
         assert executor._current_host is None
+
+
+class TestCheckSSHPasswordLogin:
+    """Tests for check_ssh_password_login with mocked Paramiko."""
+
+    @patch("production_test_framework.ssh.paramiko.SSHClient")
+    def test_login_and_command_success(self, mock_ssh_cls):
+        mock_client = MagicMock()
+        mock_ssh_cls.return_value = mock_client
+        mock_stdout = MagicMock()
+        mock_stdout.read.return_value = b"ok"
+        mock_stderr = MagicMock()
+        mock_stderr.read.return_value = b""
+        mock_stdout.channel.recv_exit_status.return_value = 0
+        mock_client.exec_command.return_value = (MagicMock(), mock_stdout, mock_stderr)
+
+        result = check_ssh_password_login("10.0.0.5", "ubuntu", "pw")
+
+        assert result.success is True
+        assert result.stdout == "ok"
+        # password auth only: no key/agent lookups
+        kwargs = mock_client.connect.call_args.kwargs
+        assert kwargs["username"] == "ubuntu"
+        assert kwargs["password"] == "pw"
+        assert kwargs["allow_agent"] is False
+        assert kwargs["look_for_keys"] is False
+        mock_client.close.assert_called_once()
+
+    @patch("production_test_framework.ssh.paramiko.SSHClient")
+    def test_connection_failure_returns_negative(self, mock_ssh_cls):
+        mock_client = MagicMock()
+        mock_ssh_cls.return_value = mock_client
+        mock_client.connect.side_effect = Exception("auth failed")
+
+        result = check_ssh_password_login("10.0.0.5", "ubuntu", "wrong")
+
+        assert result.success is False
+        assert result.returncode == -1
+        assert "auth failed" in result.stderr
+        mock_client.exec_command.assert_not_called()
+
+
+class TestWaitForSSHPasswordLogin:
+    """Tests for wait_for_ssh_password_login."""
+
+    @patch("production_test_framework.ssh.check_ssh_password_login")
+    def test_returns_on_first_success(self, mock_login):
+        mock_login.return_value = CommandResult(returncode=0, stdout="", stderr="")
+
+        result = wait_for_ssh_password_login("10.0.0.5", "ubuntu", "pw", timeout=5)
+
+        assert result.success is True
+        assert mock_login.call_count == 1
+
+    @patch("production_test_framework.ssh.time.sleep")
+    @patch("production_test_framework.ssh.check_ssh_password_login")
+    def test_retries_until_success(self, mock_login, mock_sleep):
+        mock_login.side_effect = [
+            CommandResult(returncode=-1, stdout="", stderr="refused"),
+            CommandResult(returncode=0, stdout="", stderr=""),
+        ]
+
+        result = wait_for_ssh_password_login("10.0.0.5", "ubuntu", "pw", timeout=30, interval=1)
+
+        assert result.success is True
+        assert mock_login.call_count == 2
+
+    @patch("production_test_framework.ssh.time.monotonic")
+    @patch("production_test_framework.ssh.time.sleep")
+    @patch("production_test_framework.ssh.check_ssh_password_login")
+    def test_returns_last_failure_on_timeout(self, mock_login, mock_sleep, mock_monotonic):
+        # deadline computed at t=0 (=> 10); one attempt at t=0, then t=100 exits the loop.
+        mock_monotonic.side_effect = [0, 0, 100]
+        mock_login.return_value = CommandResult(returncode=-1, stdout="", stderr="refused")
+
+        result = wait_for_ssh_password_login("10.0.0.5", "ubuntu", "pw", timeout=10, interval=1)
+
+        assert result.success is False
+        assert result.stderr == "refused"
+        assert mock_login.call_count == 1

@@ -202,6 +202,48 @@ def wait_for_tcp_connectivity(host: str, port: int, timeout: float = 30) -> bool
     return False
 
 
+def ping(
+    host: str, count: int = 1, timeout: float = 2.0, interface: Optional[str] = None
+) -> bool:
+    """
+    Return True if the host answers an ICMP echo request.
+
+    Uses the system `ping` (Linux flags). Runs locally via subprocess, so the
+    host must be reachable from wherever this runs.
+
+    Args:
+        host: Target hostname or IP.
+        count: Number of echo requests to send.
+        timeout: Per-reply wait in seconds.
+        interface: Source interface (or address) to ping from, passed as
+            `ping -I`. If None, the OS chooses the outgoing interface.
+
+    Returns:
+        True if at least one reply was received.
+    """
+    per_reply = max(1, int(timeout))
+    cmd = ["ping", "-c", str(count), "-W", str(per_reply)]
+    if interface:
+        cmd += ["-I", interface]
+    cmd.append(host)
+    return run_command(cmd, timeout=count * per_reply + 5).success
+
+
+def wait_for_ping(
+    host: str,
+    timeout: float = 60.0,
+    interval: float = 5.0,
+    interface: Optional[str] = None,
+) -> bool:
+    """Poll ping(host) until it succeeds or timeout elapses."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if ping(host, interface=interface):
+            return True
+        time.sleep(interval)
+    return False
+
+
 def get_mimir_base_url(mimir_port: int) -> str:
     """Get the base URL for Mimir Prometheus API."""
     return f"http://localhost:{mimir_port}/prometheus"
