@@ -8,6 +8,7 @@ Provides helpers for executing commands on remote hosts via SSH.
 """
 
 import socket
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -30,6 +31,106 @@ class CommandResult:
 
     def __bool__(self) -> bool:
         return self.success
+
+
+def check_ssh_password_login(
+    host: str,
+    username: str,
+    password: str,
+    *,
+    port: int = 22,
+    timeout: int = 30,
+    command: str = "true",
+) -> CommandResult:
+    """
+    Attempt a password-authenticated SSH login to a host and run a command.
+
+    Key and agent auth are disabled so only the supplied password is used,
+    making this a genuine password-login check (useful for verifying a freshly
+    provisioned OS accepts its configured credentials).
+
+    Args:
+        host: Target hostname or IP.
+        username: SSH username.
+        password: SSH password.
+        port: SSH port (default 22).
+        timeout: Connect and command timeout in seconds.
+        command: Command to run once connected (default "true", a no-op login check).
+
+    Returns:
+        CommandResult; returncode -1 (with the error in stderr) on connection
+        or authentication failure. result.success is True when both the login
+        and the command succeeded.
+    """
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            hostname=host,
+            port=port,
+            username=username,
+            password=password,
+            allow_agent=False,
+            look_for_keys=False,
+            timeout=timeout,
+        )
+    except Exception as e:
+        return CommandResult(returncode=-1, stdout="", stderr=f"ssh login to {host} failed: {e}")
+
+    try:
+        stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+        del stdin
+        stdout_str = stdout.read().decode("utf-8", errors="replace").strip()
+        stderr_str = stderr.read().decode("utf-8", errors="replace").strip()
+        exit_status = stdout.channel.recv_exit_status()
+        return CommandResult(returncode=exit_status, stdout=stdout_str, stderr=stderr_str)
+    except Exception as e:
+        return CommandResult(returncode=-1, stdout="", stderr=str(e))
+    finally:
+        client.close()
+
+
+def wait_for_ssh_password_login(
+    host: str,
+    username: str,
+    password: str,
+    *,
+    port: int = 22,
+    timeout: float = 120.0,
+    interval: float = 5.0,
+    connect_timeout: int = 15,
+    command: str = "true",
+) -> CommandResult:
+    """
+    Poll check_ssh_password_login until it succeeds or `timeout` elapses.
+
+    A host can answer ICMP (or even accept TCP) before sshd is ready to
+    authenticate, so a single login attempt is racy; this retries.
+
+    Args:
+        host: Target hostname or IP.
+        username: SSH username.
+        password: SSH password.
+        port: SSH port (default 22).
+        timeout: Total seconds to keep retrying.
+        interval: Seconds between attempts.
+        connect_timeout: Per-attempt connect/command timeout.
+        command: Command to run once connected (default "true").
+
+    Returns:
+        The last CommandResult. On timeout this is the final failed attempt
+        (result.success is False).
+    """
+    deadline = time.monotonic() + timeout
+    last = CommandResult(returncode=-1, stdout="", stderr="no attempt made")
+    while time.monotonic() < deadline:
+        last = check_ssh_password_login(
+            host, username, password, port=port, timeout=connect_timeout, command=command
+        )
+        if last.success:
+            return last
+        time.sleep(interval)
+    return last
 
 
 class SSHExecutor:

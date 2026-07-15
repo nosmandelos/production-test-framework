@@ -8,13 +8,16 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
+from production_test_framework.ssh import CommandResult
 from production_test_framework.helper import (
     check_tcp_connectivity,
     get_mimir_base_url,
     is_localhost,
+    ping,
     query_mimir,
     run_cancellable_command,
     run_command,
+    wait_for_ping,
     wait_for_tcp_connectivity,
 )
 
@@ -185,6 +188,60 @@ class TestWaitForTcpConnectivity:
         result = wait_for_tcp_connectivity("localhost", 8080, timeout=1)
 
         assert result is False
+
+
+class TestPing:
+    """Tests for ping."""
+
+    @patch("production_test_framework.helper.run_command")
+    def test_returns_true_on_reply(self, mock_run):
+        mock_run.return_value = CommandResult(returncode=0, stdout="", stderr="")
+
+        assert ping("10.0.0.1") is True
+        cmd = mock_run.call_args.args[0]
+        assert cmd[0] == "ping"
+        assert cmd[-1] == "10.0.0.1"
+
+    @patch("production_test_framework.helper.run_command")
+    def test_returns_false_on_no_reply(self, mock_run):
+        mock_run.return_value = CommandResult(returncode=1, stdout="", stderr="")
+
+        assert ping("10.0.0.1") is False
+
+    @patch("production_test_framework.helper.run_command")
+    def test_passes_interface(self, mock_run):
+        mock_run.return_value = CommandResult(returncode=0, stdout="", stderr="")
+
+        assert ping("10.0.0.1", interface="eth0") is True
+        cmd = mock_run.call_args.args[0]
+        assert "-I" in cmd
+        assert cmd[cmd.index("-I") + 1] == "eth0"
+        assert cmd[-1] == "10.0.0.1"
+
+    @patch("production_test_framework.helper.run_command")
+    def test_omits_interface_flag_when_none(self, mock_run):
+        mock_run.return_value = CommandResult(returncode=0, stdout="", stderr="")
+
+        assert ping("10.0.0.1") is True
+        cmd = mock_run.call_args.args[0]
+        assert "-I" not in cmd
+
+
+class TestWaitForPing:
+    """Tests for wait_for_ping."""
+
+    @patch("production_test_framework.helper.ping")
+    def test_returns_true_when_immediate_success(self, mock_ping):
+        mock_ping.return_value = True
+
+        assert wait_for_ping("10.0.0.1", timeout=5) is True
+
+    @patch("production_test_framework.helper.ping")
+    @patch("production_test_framework.helper.time.sleep")
+    def test_returns_false_on_timeout(self, mock_sleep, mock_ping):
+        mock_ping.return_value = False
+
+        assert wait_for_ping("10.0.0.1", timeout=1, interval=0.1) is False
 
 
 class TestGetMimirBaseUrl:
