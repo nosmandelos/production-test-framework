@@ -1,212 +1,250 @@
 # Production Test Framework
 
-The Production Test Framework provides automated infrastructure for deploying, validating, and testing production platform components. This framework automates cluster setup, service deployment, and execution of integration tests.
+`production-test-framework` is an installable **Python package** of reusable building
+blocks for deploying, validating, and load-testing production platform components —
+Kubernetes clusters, the LGTM observability stack, network switches, and vLLM
+inference services. It is distributed as a Python wheel and shipped inside a Docker
+image that also bundles the CLI tooling (`kubectl`, `helm`, `k3d`) needed to drive an
+end-to-end test run.
 
-## Overview
+- **Package name:** `production-test-framework` (import as `production_test_framework`)
+- **Python:** `>= 3.14`
+- **Build backend:** hatchling + hatch-vcs (version derived from git tags)
+- **License:** FSL-1.1-ALv2 — © Delos Data, Inc.
 
-The framework enables end-to-end testing of the following areas:
+## Table of contents
 
-- **K3s Cluster Management**: Automated bootstrap and validation of k3s clusters
-- **LGTM Stack Deployment**: Automated deployment of Loki, Grafana, Tempo, and Mimir
-- **Integration Testing**: Automated test execution with proper setup and teardown
-- **Infrastructure Automation**: SSH tunnels, kubeconfig management, and dependency synchronization
+- [Design principle: generic, open interfaces only](#design-principle-generic-open-interfaces-only)
+- [What's included](#whats-included)
+- [Installation & usage](#installation--usage)
+- [Build & deploy](#build--deploy)
+- [Tagging a release on GitHub](#tagging-a-release-on-github)
+- [Running the test harness (Docker image)](#running-the-test-harness-docker-image)
+- [Development](#development)
+- [License](#license)
 
-## Quick Start
+## Design principle: generic, open interfaces only
 
-To get tests running with a single command: clone the repo, copy and edit `.env` to set the required and optional environment variables:
+**This package integrates only through generic, open, standardized interfaces. It does
+not depend on proprietary or system-specific vendor libraries or SDKs.**
+
+Every integration is built on a protocol or API that is openly documented and
+vendor-neutral:
+
+| Concern | Open interface used | Library |
+| --- | --- | --- |
+| Remote command execution | SSH | `paramiko` |
+| Kubernetes | `kubectl` CLI over SSH / locally | (kubectl) |
+| Network switches | **NVUE REST API** (open, documented) | `requests` |
+| Inference | OpenAI-compatible HTTP (vLLM) | `requests` |
+| Telemetry | OTLP over gRPC (OpenTelemetry) | `opentelemetry-*` |
+| Metrics query | Prometheus/Mimir HTTP API | `requests` |
+| Configuration mgmt | Ansible playbooks | `ansible-core` |
+
+The NVIDIA Cumulus switch driver, for example, talks to the switch exclusively over
+the **open NVUE REST API** — not a proprietary SDK. This keeps drivers swappable and
+the package portable.
+
+> **Contribution rule:** new drivers and integrations must be implemented against an
+> open, standard interface. Do not add dependencies on proprietary or system-specific
+> vendor libraries.
+
+## What's included
+
+### Third-party libraries
+
+Runtime dependencies (see [`pyproject.toml`](pyproject.toml)):
+
+| Library | Purpose |
+| --- | --- |
+| `paramiko` | SSH transport and command execution |
+| `requests` | HTTP/REST clients (NVUE, vLLM, Mimir) |
+| `ansible-core` | Runs the playbooks under [`ansible/`](ansible/) |
+| `locust` | Load generation |
+| `opentelemetry-api` / `-sdk` / `-exporter-otlp-proto-grpc` | OTLP metrics emission |
+| `qase-pytest` | Qase TestOps test reporting |
+| `docopt` | CLI argument parsing for `switch-status` |
+| `pip` | Runtime package management inside the image |
+
+### Modules the package provides
+
+Importable API under `production_test_framework`:
+
+| Module | Key public API |
+| --- | --- |
+| `config` | `LGTMConfig` — LGTM/host config dataclass (`from_env()`) |
+| `ssh` | `SSHExecutor`, `CommandResult`, `check_ssh_password_login`, `wait_for_ssh_password_login` |
+| `helper` | `run_command`, `run_cancellable_command`, `ping` / `wait_for_ping`, `check_tcp_connectivity`, `query_mimir` |
+| `k8s` | `KubernetesClient`, `KubectlPortForwarder`, `LocalKubectlPortForwarder`, `Node`, `Pod` |
+| `vllm` | `VllmClient`, `VllmConfig`, `InferenceResult` |
+| `switch` | `NetworkSwitch` (ABC), `create_switch`, `SwitchType`, `NvidiaCumulusSwitch` (NVUE driver), `SwitchAPIError` |
+| `workload` | `Workload` (ABC), `PromptWorkload`, `InferencexWorkload`, `WorkloadResult` |
+| `telemetry` | `Otelp`, `OtelpConfig`, `create_otelp` |
+| `loadgen` | `LocustMetricsUser`, `LocustTestConfig`, `run_locust_test` |
+| `utils` | `wait_for` (generic polling) |
+
+### Console script
+
+Installing the package provides a `switch-status` command-line tool
+(entry point `production_test_framework.switch.switch_status:main`) for querying
+network switch status over the NVUE REST API.
+
+## Installation & usage
+
+The package targets Python 3.14+. Using [`uv`](https://docs.astral.sh/uv/):
 
 ```bash
-git clone <repo-url> production-test-framework
-cd production-test-framework
-cp env.example .env
-# Edit .env: CLUSTER, and the other fields checked by `make prereqs`
+# From a checkout of this repo
 uv sync
-make test
 ```
 
-The sections below cover prerequisites, cluster access, the other [Makefile targets](#makefile-targets), and [running in Docker](#running-with-docker).
-
-## Prerequisites
-
-Before using the framework, ensure you have the following installed:
-
-- `kubectl` - Kubernetes command-line tool
-- `helm` - Kubernetes package manager
-- `uv` - Python package manager
-- **k3d** and **sudo** (only for `test-production`, `create-test-cluster`, and `destroy-test-cluster`, which create/deletes a local k3d cluster)
-
-### Required Environment Variables
-
-The framework requires the following environment variables to be set:
+Add it as a dependency of your own uv project directly from GitHub. The version is
+resolved from git tags, so pin a tag/branch/commit with `@<ref>` for a reproducible
+install:
 
 ```bash
-export ANSIBLE_REMOTE_USER="your-ssh-username"
-export REMOTE_HOST="target-cluster-hostname-or-ip"
-export CLUSTER="cluster-name"
-export ANSIBLE_INVENTORY_FILE="/path/to/ansible/inventory.ini"
+# A specific release tag (recommended)
+uv add "git+https://github.com/thurttdd/production-test-framework.git@v0.3.0"
+
+# Latest from the default branch
+uv add "git+https://github.com/thurttdd/production-test-framework.git"
 ```
 
-For Qase test reporting, set **`QASE_TESTOPS_API_TOKEN`** (optional). If unset, `make prereqs` will report it as missing but tests can still run.
+For private-repo access over HTTPS, provide a token
+(`git+https://<token>@github.com/...`), or use SSH form
+(`git+ssh://git@github.com/thurttdd/production-test-framework.git@v0.3.0`).
 
-You can also create a `.env` file in the project root with the variables above specified. Copy `env.example` to `.env` and edit the values. The `.env` file will be loaded when make is run.
+Use the library in your own tests or scripts:
 
-## Quick Start
+```python
+from production_test_framework.config import LGTMConfig
+from production_test_framework.k8s import KubernetesClient
+from production_test_framework.switch import create_switch, SwitchType
 
-### 1. Clone and set up
+config = LGTMConfig.from_env()
+k8s = KubernetesClient(config)
+print(k8s.all_nodes_ready())
+```
 
-Clone this repository, then create your local configuration:
+Run the bundled CLI:
 
 ```bash
-git clone <repo-url> production-test-framework
-cd production-test-framework
-cp env.example .env
-# Edit .env (and add ansible/inventory.ini if you use Ansible outside this Makefile)
-uv sync
+switch-status --help
+switch-status --hostname switch01 --username admin --switch-type nvidia-cumulus
 ```
 
-### 2. Check Prerequisites
+## Build & deploy
 
-Verify all prerequisites are installed and environment variables are set:
+### Build the wheel
+
+The package uses **hatchling** with **hatch-vcs**, so the version is derived from git
+tags — there is no hard-coded version in `pyproject.toml`.
 
 ```bash
-make prereqs
+uv build          # produces sdist + wheel in dist/
 ```
 
-### 3. Run tests
+For a local build on a commit **without** a tag (or with a trimmed git history), set a
+pretend version so hatch-vcs can resolve one:
 
 ```bash
-# Full flow: deploy Helm charts -> run tests -> undeploy
-make test
-
-# No deploy/undeploy: run the main suite (marker "not teardown")
-make test-run-only
-
-# k3d lifecycle: create cluster -> deploy -> run-tests -> destroy cluster
-make test-production
-
-# Same as `make run-tests` with Open Mosaic specific setup and test markers
-make test-openmosaic
+export SETUPTOOLS_SCM_PRETEND_VERSION=0.3.0.dev
+uv build
 ```
 
-Run `make help` for the full list, or `make help-container-targets` in the [Docker image](#running-with-docker).
+Versioning rules:
 
-## Makefile Targets
+- **Tagged commit** `v0.3.0` → version `0.3.0`.
+- **Untagged commit** after a tag → dev suffix, e.g. `0.3.0.dev8+gc88d493`.
 
-### Infrastructure management
+### Build the Docker image
 
-- **`prereqs`** - Check for missing prerequisites and environment variables
-- **`deploy-helm-charts`** - Deploy charts (expects `kubectl` context configured; uses `CLUSTER` in messages)
-- **`undeploy-helm-charts`** - Remove the `mosaic` namespace / release
-
-### Setting up a test cluster using k3d and k3s
-
-- **`create-test-cluster`** - Create a k3d cluster named `${CI_JOB_ID}-k3s` and a `mosaic` namespace
-- **`destroy-test-cluster`** - Delete that k3d cluster
-
-### Building blocks
-
-- **`run-tests`** - Run pytest once with `TEST_MARKER` (no Helm undeploy, no separate teardown pass)
-- **`run-all-tests`** - `run-tests`, then `undeploy-helm-charts`, then pytest with the `teardown` marker
-- **`help`** / **`help-container-targets`** - Print help (the latter is a short list for container/CI use)
-
-### Top-level tests
-
-- **`test`** - `prereqs` → `deploy-helm-charts` → `run-all-tests` (main tests, undeploy, teardown tests)
-- **`test-run-only`** - `prereqs` and a `run-tests` with marker `not teardown` (no deploy/undeploy)
-- **`test-production`** - `create-test-cluster` → `deploy-helm-charts` → `run-tests` → `destroy-test-cluster`
-- **`test-openmosaic`** - Same as `run-tests` (convenience target for an already-running stack)
-
-### Test options
-
-- **`TEST_MARKER`** - Pytest marker (default: `k3s or lgtm or metrics`). `test-run-only` forces `not teardown` in the Makefile; set `TEST_MARKER` for other targets as needed.
-- **`PYTEST_ADDOPTS`** - Extra pytest options (pytest reads this environment variable).
-- **`QASE_TESTOPS_RUN_TITLE`** - Qase automated test run title. Default: "Production test run <commit-hash> [dirty]". Override for CI or custom runs.
-- **`CI_JOB_ID`** - Used in the k3d cluster name (default `local`); set in CI to avoid collisions.
-
-```bash
-make test-run-only PYTEST_ADDOPTS='-x'
-make test QASE_TESTOPS_RUN_TITLE="CI run 123"
-```
-
-## Test Structure
-
-By default, tests are expected in `./tests/lgtm/` (a child directory). Set `TESTS_DIR` if your tests live elsewhere. Tests are organized by validation area:
-
-- **`test_k3s_cluster.py`** - K3s cluster health and node validation
-- **`test_namespaces.py`** - Namespace and pod validation
-- **`test_services.py`** - Service and storage validation
-- **`test_teardown.py`** - Post-teardown validation
-
-Tests use pytest markers for organization:
-- `k3s` - K3s cluster validation tests
-- `lgtm` - LGTM stack integration tests
-- `metrics` - Metrics-related tests (when present)
-- `teardown` - Teardown validation tests
-
-
-## Building the test framework Docker image
-
-From the project root:
+The image ([`Dockerfile`](Dockerfile)) bundles the package plus `kubectl`, `helm`,
+`k3d`, `uv`, and Python 3.14, and runs as a non-root user.
 
 ```bash
 docker build -t production-test-framework .
+
+# Optionally stamp the git hash / version (CI does this automatically):
+docker build \
+  --build-arg GIT_HASH=$(git rev-parse --short HEAD) \
+  --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=0.3.0 \
+  -t production-test-framework .
 ```
 
-Optionally pass the git hash as a build arg: `docker build --build-arg GIT_HASH=$(git rev-parse --short HEAD) -t production-test-framework .`
+### Deploy (Docker Hub via CI)
 
-## Running with Docker
+Images are published automatically by
+[`.github/workflows/docker.yml`](.github/workflows/docker.yml):
 
-### 1. Build and run
+| Trigger | Image tags pushed |
+| --- | --- |
+| Push to `main` | `latest`, `sha-<short-sha>` |
+| Push tag `v*` | `<tag>` (e.g. `v0.3.0`), `latest` |
+| Pull request | built only, not pushed (`pr-<n>`) |
 
-Build the image as shown above. To run the container with a minimal setup:
+On a `v*` tag, CI also passes `SETUPTOOLS_SCM_PRETEND_VERSION=<version without v>` into
+the build so the packaged version matches the tag.
+
+Required repository secrets: `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN` (and optionally
+`DOCKERHUB_REPO` to override the target repository).
+
+> **Note:** the package is **not currently published to PyPI**. Distribution is via the
+> built wheel and the Docker image.
+
+## Tagging a release on GitHub
+
+Because the version is git-tag-driven, cutting a release is just a tag push. The tag
+simultaneously sets the package version (hatch-vcs) **and** the Docker image tag (CI).
 
 ```bash
-docker run -it --rm production-test-framework
+# Create an annotated tag with a PEP 440 version, v-prefixed
+git tag -a v0.3.0 -m "Release 0.3.0"
+git push origin v0.3.0
 ```
 
-The sections below describe how to set environment variables, optionally forward SSH, and mount your tests and Helm charts so you can run `make` inside the container.
+This triggers `docker.yml`, which builds and pushes the `v0.3.0` and `latest` images to
+Docker Hub with the version baked in.
 
-### 2. Environment variables for the container
-
-The required environment variables for cluster validation are: **`ANSIBLE_REMOTE_USER`**, **`REMOTE_HOST`**, **`CLUSTER`**, and **`ANSIBLE_INVENTORY_FILE`**. Optional variables include **`TESTS_DIR`**, and **`QASE_TESTOPS_API_TOKEN`** (see [Required Environment Variables](#required-environment-variables) above).
-
-You can provide them by:
-
-- **Mounting a `.env` file** into the container (e.g. `-v $(pwd)/.env:/app/framework/.env:ro`). The Makefile loads `.env` from the framework directory when you run `make`.
-- **Passing variables** with `-e VAR=value` or `--env-file` for each run.
-
-If you do not mount a `.env` file, the image uses built-in defaults (see the Dockerfile). Copy [env.example](env.example) to `.env` and edit it for your environment.
-
-### 3. SSH agent forwarding (optional)
-
-If you run Ansible or other tools that SSH from the container, forward your agent so keys are available:
-
-1. On the host, ensure your SSH agent has the key loaded: `ssh-add -l` (use `ssh-add` to add it).
-2. When running the container, pass the agent socket in:
-   - `-e SSH_AUTH_SOCK=/tmp/ssh-agent/socket`
-   - `-v $SSH_AUTH_SOCK:/tmp/ssh-agent/socket`
-
-If SSH connections fail, see [SSH Connection Issues](#ssh-connection-issues) in Troubleshooting.
-
-### 4. Mounting test files and mosaic Helm charts
-
-- **Tests:** The Makefile uses **`/app/framework/tests`** (see `TESTS_DIR`). The [docker entrypoint](scripts/docker-entrypoint.sh) copies **`/app/tests/*`** into `/app/framework/tests/`, so a typical mount is `-v /path/to/your/tests:/app/tests:ro`. You can also mount straight to `/app/framework/tests` if you do not rely on that copy. Tests are Python and run with pytest.
-- **Helm charts:** The Makefile runs Helm from `/app/framework/charts/mosaic` (see `deploy-helm-charts`). You can mount that path directly, e.g. `-v /path/to/mosaic/charts/mosaic:/app/framework/charts/mosaic:ro`. Alternatively, mount your charts under **`/app/charts`**; [scripts/docker-entrypoint.sh](scripts/docker-entrypoint.sh) copies `/app/charts/*` into `/app/framework/charts/` at container start.
-
-A full example that combines `.env`, tests, mosaic, and SSH agent forwarding is shown in the code block in the next section; see also [scripts/launch_framework.sh](scripts/launch_framework.sh).
-
-### 5. Executing tests from the container shell
-
-By default, the container starts an interactive shell in `/app/framework`. The entrypoint prints a banner and runs `make help-container-targets` so you can see available targets. Run tests with `make`:
+Optionally publish a GitHub Release from the tag so release notes (and, if you attach
+them, the built wheel/sdist) are visible on the Releases page:
 
 ```bash
-make test
-make test-run-only
-make test-production
-make test-openmosaic
+uv build                                   # build artifacts to attach
+gh release create v0.3.0 \
+  --title "v0.3.0" \
+  --generate-notes \
+  dist/production_test_framework-0.3.0*
 ```
 
-The Makefile loads `.env` from the framework directory, so a mounted `.env` is used automatically. For a full `docker run` example with env, tests, Helm charts, and optional SSH forwarding:
+Guidelines:
+
+- Use **`v`-prefixed, PEP 440** versions (`v0.3.0`, `v1.0.0rc1`).
+- Prefer **annotated** tags (`-a`) so the release carries a message.
+- Commits after a tag are automatically versioned as dev builds
+  (`0.3.0.devN+g<sha>`) — no action needed for interim builds.
+
+## Running the test harness (Docker image)
+
+The Docker image is a ready-to-run consumer of the package: it bundles `kubectl`,
+`helm`, and `k3d`, and drives test runs through the [`Makefile`](Makefile). This is the
+recommended way to execute a full deploy → test → teardown cycle.
+
+### Environment variables
+
+Provide these to the container (via a mounted `.env` or `-e` flags). See
+[`env.example`](env.example).
+
+| Variable | Purpose |
+| --- | --- |
+| `ANSIBLE_REMOTE_USER` | SSH username for the target host |
+| `REMOTE_HOST` | Target cluster hostname/IP |
+| `CLUSTER` | Cluster name |
+| `ANSIBLE_INVENTORY_FILE` | Path to the Ansible inventory |
+| `TESTS_DIR` | Test directory override (optional) |
+| `QASE_TESTOPS_API_TOKEN` | Qase reporting token (optional) |
+
+### Run interactively
 
 ```bash
 docker run -it --rm \
@@ -218,83 +256,45 @@ docker run -it --rm \
   production-test-framework
 ```
 
-Then run `make test` (or another target) inside the container. See [Makefile Targets](#makefile-targets) for all test targets.
+The entrypoint ([`scripts/docker-entrypoint.sh`](scripts/docker-entrypoint.sh)) copies
+mounted tests/charts into place and drops you into a shell in `/app/framework`. From
+there, run a Makefile target:
 
-### 6. Running a single make target (RUN_MAKE_TARGET)
+| Target | What it does |
+| --- | --- |
+| `make test` | `prereqs` → deploy charts → run tests → teardown |
+| `make test-run-only` | Run the main suite only (no deploy/undeploy) |
+| `make test-production` | Create k3d cluster → deploy → test → destroy cluster |
+| `make help` | List all targets |
 
-If you set **`RUN_MAKE_TARGET`**, the entrypoint runs that make target and exits; no interactive shell or banner is shown. Use this for CI or one-off non-interactive runs:
+### Run a single target (CI / non-interactive)
+
+Set `RUN_MAKE_TARGET` to run one target and exit — no shell, no banner:
 
 ```bash
 docker run -it --rm \
   -e RUN_MAKE_TARGET=test-run-only \
   -v $(pwd)/.env:/app/framework/.env:ro \
   -v /path/to/your/tests:/app/tests:ro \
-  -v /path/to/helm/charts/mosaic:/app/framework/charts/mosaic:ro \
-  -e SSH_AUTH_SOCK=/tmp/ssh-agent/socket \
-  -v $SSH_AUTH_SOCK:/tmp/ssh-agent/socket \
   production-test-framework
 ```
 
-Pre-built images are published to Docker Hub via GitHub Actions (see `.github/workflows/` for CI; configure `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` secrets for pushes).
-
-## Troubleshooting
-
-### Prerequisites Not Found
-
-If `make prereqs` shows missing tools:
+## Development
 
 ```bash
-# Install missing prerequisites
-# For macOS:
-brew install kubectl helm
-
-# For Python/uv:
-curl -LsSf https://astral.sh/uv/install.sh | sh
+uv sync --all-packages --group dev   # install package + dev tools
+uv run pytest                        # run unit tests
+uv run ruff check src unit_tests     # lint (line length 120, py314)
+uv run ruff format src unit_tests    # format
+pre-commit install                   # enable git hooks
 ```
 
-Ansible is provided by the project's Python dependencies; run `uv sync` from the project root so that `ansible` is available on your PATH via `uv run` when you need it.
+Unit tests live in the [`unit_tests/`](unit_tests/) uv-workspace member and are **not**
+shipped in the wheel (which packages only `src/production_test_framework`). CI runs
+`uv run pytest` on every push and pull request
+([`.github/workflows/test.yml`](.github/workflows/test.yml)).
 
-### SSH Connection Issues
+## License
 
-If SSH connections fail:
-
-1. Ensure your SSH agent has the key loaded: `ssh-add -l` (use `ssh-add` to add it).
-2. Test SSH connection manually: `ssh $ANSIBLE_REMOTE_USER@$REMOTE_HOST`
-3. Check that `ANSIBLE_REMOTE_USER` and `REMOTE_HOST` are set correctly
-
-### Test Failures
-
-If tests fail:
-
-1. Check cluster status: `kubectl get nodes`
-2. Verify pods are running: `kubectl get pods -A`
-3. Check Helm chart deployment: `helm list -n mosaic`
-4. Review test output for specific error messages
-
-
-## Versioning and releases
-
-The Python package version is derived from **git tags**, not a static value in `pyproject.toml`. Push an annotated or lightweight tag with a `v` prefix and a [PEP 440](https://peps.python.org/pep-0440/) version:
-
-```bash
-git tag v0.2.0
-git push origin v0.2.0
-```
-
-- **Released builds** (on tag `v*`) use that version (for example `0.2.0` from tag `v0.2.0`).
-- **Development builds** (commits after the latest tag) get a dev suffix such as `0.2.0.dev3+gabc1234`.
-- **Docker images** on tag push are tagged with the same `v*` name; the image build sets the package version from the tag.
-
-To build or install locally without a tag, either create a tag or set a pretend version:
-
-```bash
-export SETUPTOOLS_SCM_PRETEND_VERSION=0.2.0.dev
-uv sync
-```
-
-## Getting Help
-
-For more information:
-
-- Run `make help` from the project root to see all available targets
-- Review test documentation in `../tests/lgtm/README.md` if you use the default tests layout
+Functional Source License, Version 1.1, Apache 2.0 Future License
+(**FSL-1.1-ALv2**). © 2025 Delos Data, Inc. See [`LICENSE`](LICENSE).
