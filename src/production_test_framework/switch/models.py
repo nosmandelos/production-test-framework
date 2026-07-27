@@ -29,6 +29,15 @@ class Vlan:
 
 
 @dataclass(frozen=True)
+class LldpNeighbor:
+    """An LLDP neighbor advertising a MAC-address chassis id on a switch port."""
+
+    interface: str
+    switch_port: int
+    chassis_mac: str
+
+
+@dataclass(frozen=True)
 class SwitchProcess:
     name: str
     pid: int

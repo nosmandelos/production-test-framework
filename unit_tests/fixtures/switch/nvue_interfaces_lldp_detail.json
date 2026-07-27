@@ -1,0 +1,42 @@
+{
+  "eth0": {
+    "lldp": {
+      "neighbor": {
+        "0": {
+          "port": { "type": "mac", "name": "aa:bb:cc:00:00:99", "description": "mgmt" }
+        }
+      }
+    }
+  },
+  "lo": {},
+  "swp1": {
+    "lldp": {
+      "neighbor": {
+        "0": {
+          "port": { "type": "mac", "name": "AA:BB:CC:11:22:33", "description": "enp1s0" }
+        }
+      }
+    }
+  },
+  "swp2": {
+    "lldp": {
+      "neighbor": {
+        "0": {
+          "port": { "type": "ifname", "name": "swp5", "description": "peer-switch" }
+        }
+      }
+    }
+  },
+  "swp3s0": {
+    "lldp": {
+      "neighbor": {
+        "0": {
+          "port": { "type": "mac", "name": "44556677aabb" }
+        }
+      }
+    }
+  },
+  "swp4": {
+    "lldp": {}
+  }
+}
