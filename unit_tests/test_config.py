@@ -6,6 +6,8 @@
 import os
 from unittest.mock import patch
 
+import pytest
+
 from production_test_framework.config import LGTMConfig
 
 
@@ -15,7 +17,7 @@ class TestLGTMConfig:
     def test_from_env_defaults(self):
         with patch.dict(os.environ, {}, clear=True):
             config = LGTMConfig.from_env()
-            assert config.host == ""
+            assert config.host == "localhost"
             assert config.ansible_remote_user == ""
 
     def test_from_env_with_env_vars(self):
@@ -34,4 +36,9 @@ class TestLGTMConfig:
 
     def test_validate_ssh_config_true_when_user_set(self):
         config = LGTMConfig(host="x", ansible_remote_user="user")
+        assert config.validate_ssh_config() is True
+
+    @pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "::1", "LocalHost"])
+    def test_validate_ssh_config_true_for_localhost_without_user(self, host):
+        config = LGTMConfig(host=host, ansible_remote_user="")
         assert config.validate_ssh_config() is True

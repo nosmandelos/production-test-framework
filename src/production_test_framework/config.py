@@ -16,7 +16,7 @@ class LGTMConfig:
     """Configuration for LGTM stack deployment and testing."""
 
     # Target host configuration
-    host: str = field(default_factory=lambda: os.getenv("REMOTE_HOST", ""))
+    host: str = field(default_factory=lambda: os.getenv("REMOTE_HOST", "localhost"))
 
     # SSH/Ansible configuration
     ansible_remote_user: str = field(default_factory=lambda: os.getenv("ANSIBLE_REMOTE_USER", ""))
@@ -27,7 +27,12 @@ class LGTMConfig:
     otlp_http_port: int = 4318
 
     def validate_ssh_config(self) -> bool:
-        """Check if SSH configuration is complete."""
+        """Check if SSH configuration is complete. Always true for a localhost target."""
+        # Imported here because helper -> ssh -> config would be a circular import.
+        from production_test_framework.helper import is_localhost
+
+        if is_localhost(self.host):
+            return True
         return bool(self.ansible_remote_user)
 
     @classmethod
