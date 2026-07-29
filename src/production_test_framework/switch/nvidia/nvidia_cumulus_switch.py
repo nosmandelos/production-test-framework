@@ -13,7 +13,7 @@ from requests.auth import HTTPBasicAuth
 from urllib3.util.retry import Retry
 
 from production_test_framework.switch.exceptions import SwitchAPIError
-from production_test_framework.switch.models import NetworkSwitchConfig, NetworkSwitchStatus, Port, Vlan
+from production_test_framework.switch.models import LldpNeighbor, NetworkSwitchConfig, NetworkSwitchStatus, Port, Vlan
 from production_test_framework.switch.network_switch import NetworkSwitch
 from production_test_framework.switch.nvidia.nvue_paths import (
     BRIDGE_DOMAIN,
@@ -34,6 +34,9 @@ requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.
 
 # OpenAPI getInterfaces view=description: admin-status, oper-status, description
 VIEW_DESCRIPTION = "description"
+
+# OpenAPI getInterfaces view=lldp-detail: per-interface LLDP neighbor detail.
+VIEW_LLDP_DETAIL = "lldp-detail"
 
 # NVUE applies config changes asynchronously once a changeset is applied.
 _APPLY_TIMEOUT_S = 60.0
@@ -90,6 +93,12 @@ class NvidiaCumulusSwitch(NetworkSwitch):
         vlan_configs = self._run_api_call(BRIDGE_DOMAIN_VLANS_PATH)
         membership = self._vlan_membership_by_id()
         return self._parse_vlans(vlan_configs, membership)
+
+    @property
+    def lldp_neighbors(self) -> list[LldpNeighbor]:
+        """LLDP neighbors advertising a MAC chassis id (OpenAPI getInterfaces, view=lldp-detail)."""
+        interfaces = self._run_api_call(INTERFACES_PATH, params={"view": VIEW_LLDP_DETAIL})
+        return self._parse_lldp_neighbors(interfaces)
 
     def port(self, port_id: str) -> Port:
         """Single interface (OpenAPI operationId: getInterface)."""
@@ -322,6 +331,61 @@ class NvidiaCumulusSwitch(NetworkSwitch):
     def _parse_ports(self, interfaces: dict[str, Any]) -> list[Port]:
         ports = [self._parse_port(interface_id, body) for interface_id, body in interfaces.items()]
         return sorted(ports, key=lambda port: port_id_sort_key(port.id))
+
+    def _parse_lldp_neighbors(self, interfaces: dict[str, Any]) -> list[LldpNeighbor]:
+        neighbors: list[LldpNeighbor] = []
+        for interface_id, body in interfaces.items():
+            switch_port = self._interface_name_to_port(interface_id)
+            if switch_port < 0 or not isinstance(body, dict):
+                continue
+            lldp = body.get("lldp")
+            if not isinstance(lldp, dict):
+                continue
+            per_neighbor = lldp.get("neighbor")
+            if not isinstance(per_neighbor, dict):
+                continue
+            for neighbor in per_neighbor.values():
+                if not isinstance(neighbor, dict):
+                    continue
+                # The lldp-detail view nests chassis info under "port"; keep only
+                # neighbors advertising a MAC-address chassis id.
+                port_obj = neighbor.get("port")
+                if not isinstance(port_obj, dict) or port_obj.get("type") != "mac":
+                    continue
+                port_name = port_obj.get("name")
+                if not isinstance(port_name, str):
+                    continue
+                mac = self._normalize_mac(port_name)
+                if not mac:
+                    self._logger.warning(f"lldp_neighbors: invalid MAC {port_name!r} on {interface_id}")
+                    continue
+                neighbors.append(LldpNeighbor(interface=interface_id, switch_port=switch_port, chassis_mac=mac))
+        return sorted(neighbors, key=lambda neighbor: neighbor.switch_port)
+
+    @staticmethod
+    def _interface_name_to_port(interface_id: str) -> int:
+        """Parse "swp14" -> 14 and "swp1s0" -> 1. Returns -1 for non-swp interfaces."""
+        name = interface_id.strip()
+        if not name.startswith("swp"):
+            return -1
+        rest = name[len("swp") :]
+        # Handle subinterface/breakout notation like "swp1s0" or "swp1/2".
+        separators = [idx for idx in (rest.find("s"), rest.find("/")) if idx >= 0]
+        if separators:
+            rest = rest[: min(separators)]
+        try:
+            port = int(rest)
+        except ValueError:
+            return -1
+        return port if port >= 0 else -1
+
+    @staticmethod
+    def _normalize_mac(value: str) -> str:
+        """Normalize a MAC (with or without colons) to lowercase colon form, or "" if invalid."""
+        compact = value.replace(":", "").lower()
+        if len(compact) != 12:
+            return ""
+        return ":".join(compact[i : i + 2] for i in range(0, 12, 2))
 
     def _parse_system_status(self, system: dict, platform: dict, firmware: dict) -> NetworkSwitchStatus:
         return NetworkSwitchStatus(
