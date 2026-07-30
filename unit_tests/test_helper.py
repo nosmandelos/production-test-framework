@@ -12,8 +12,11 @@ from production_test_framework.ssh import CommandResult
 from production_test_framework.helper import (
     check_tcp_connectivity,
     get_mimir_base_url,
+    get_loki_base_url,
     is_localhost,
     ping,
+    poll_until,
+    query_loki,
     query_mimir,
     run_cancellable_command,
     run_command,
@@ -168,6 +171,38 @@ class TestCheckTcpConnectivity:
             mock_sock.settimeout.assert_called_once_with(10.0)
 
 
+class TestPollUntil:
+    """Tests for poll_until."""
+
+    def test_returns_true_without_sleeping_when_already_true(self):
+        calls = []
+
+        def predicate() -> bool:
+            calls.append(1)
+            return True
+
+        with patch("production_test_framework.helper.time.sleep") as mock_sleep:
+            assert poll_until(predicate, timeout=5) is True
+
+        assert len(calls) == 1, "predicate must be evaluated once, before any sleep"
+        mock_sleep.assert_not_called()
+
+    @patch("production_test_framework.helper.time.sleep")
+    def test_retries_until_predicate_passes(self, mock_sleep):
+        results = iter([False, False, True])
+
+        assert poll_until(lambda: next(results), timeout=10, interval=0.1) is True
+        assert mock_sleep.call_count == 2
+
+    @patch("production_test_framework.helper.time.sleep")
+    @patch("production_test_framework.helper.time.monotonic")
+    def test_returns_false_on_timeout(self, mock_monotonic, mock_sleep):
+        # deadline computed at t=0 (=> 10); first attempt at t=0, then t=100 exits.
+        mock_monotonic.side_effect = [0, 0, 100]
+
+        assert poll_until(lambda: False, timeout=10, interval=1) is False
+
+
 class TestWaitForTcpConnectivity:
     """Tests for wait_for_tcp_connectivity."""
 
@@ -280,3 +315,28 @@ class TestQueryMimir:
             params=None,
             timeout=10,
         )
+
+
+class TestGetLokiBaseUrl:
+    """Tests for get_loki_base_url."""
+
+    def test_returns_correct_url(self):
+        assert get_loki_base_url(3100) == "http://localhost:3100"
+
+
+class TestQueryLoki:
+    """Tests for query_loki."""
+
+    @patch("production_test_framework.helper.requests.get")
+    def test_builds_url_and_calls_get(self, mock_get):
+        mock_resp = MagicMock()
+        mock_get.return_value = mock_resp
+
+        params = {"query": '{namespace="xpt"}'}
+        result = query_loki(3100, "/loki/api/v1/query_range", params=params)
+
+        assert result is mock_resp
+        mock_get.assert_called_once()
+        call_args = mock_get.call_args
+        assert call_args[0][0] == "http://localhost:3100/loki/api/v1/query_range"
+        assert call_args[1]["params"] == params
