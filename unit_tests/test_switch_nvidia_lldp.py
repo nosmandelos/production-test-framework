@@ -11,7 +11,7 @@ from production_test_framework.switch.models import NetworkSwitchConfig
 from production_test_framework.switch.nvidia.nvidia_cumulus_switch import VIEW_LLDP_DETAIL, NvidiaCumulusSwitch
 from production_test_framework.switch.nvidia.nvue_paths import INTERFACES_PATH
 
-FIXTURES = Path(__file__).parent / "fixtures" / "switch"
+FIXTURES = Path(__file__).parent / "fixtures" / "switch" / "nvidia"
 
 
 @pytest.fixture
@@ -27,7 +27,7 @@ def switch_config() -> NetworkSwitchConfig:
 
 @pytest.fixture
 def lldp_payload() -> dict:
-    return json.loads((FIXTURES / "nvue_interfaces_lldp_detail.json").read_text())
+    return json.loads((FIXTURES / "interfaces_lldp_detail.json").read_text())
 
 
 def _switch() -> NvidiaCumulusSwitch:

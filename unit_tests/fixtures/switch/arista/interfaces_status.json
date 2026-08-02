@@ -1,0 +1,19 @@
+{
+  "interfaceStatuses": {
+    "Ethernet1": {
+      "linkStatus": "connected",
+      "lineProtocolStatus": "up",
+      "description": "server-1"
+    },
+    "Ethernet2": {
+      "linkStatus": "disabled",
+      "lineProtocolStatus": "down",
+      "description": ""
+    },
+    "Ethernet10": {
+      "linkStatus": "notconnect",
+      "lineProtocolStatus": "down",
+      "description": "uplink"
+    }
+  }
+}
