@@ -1,0 +1,13 @@
+{
+  "vlans": {
+    "10": {
+      "interfaces": {
+        "Ethernet2": {},
+        "Ethernet1": {}
+      }
+    },
+    "2": {
+      "interfaces": {}
+    }
+  }
+}

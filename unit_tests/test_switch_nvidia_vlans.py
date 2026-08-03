@@ -12,7 +12,7 @@ from production_test_framework.switch.models import NetworkSwitchConfig
 from production_test_framework.switch.nvidia.nvidia_cumulus_switch import NvidiaCumulusSwitch
 from production_test_framework.switch.nvidia.nvue_paths import BRIDGE_DOMAIN_VLANS_PATH
 
-FIXTURES = Path(__file__).parent / "fixtures" / "switch"
+FIXTURES = Path(__file__).parent / "fixtures" / "switch" / "nvidia"
 
 
 @pytest.fixture
@@ -29,12 +29,12 @@ def switch_config() -> NetworkSwitchConfig:
 
 @pytest.fixture
 def vlan_configs() -> dict:
-    return json.loads((FIXTURES / "nvue_bridge_vlans.json").read_text())
+    return json.loads((FIXTURES / "bridge_vlans.json").read_text())
 
 
 @pytest.fixture
 def interfaces_bridge() -> dict:
-    return json.loads((FIXTURES / "nvue_interfaces_bridge.json").read_text())
+    return json.loads((FIXTURES / "interfaces_bridge.json").read_text())
 
 
 def test_vlan_membership_from_interfaces(switch_config: NetworkSwitchConfig, interfaces_bridge: dict) -> None:

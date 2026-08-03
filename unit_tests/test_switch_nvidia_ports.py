@@ -11,7 +11,7 @@ from production_test_framework.switch.models import NetworkSwitchConfig
 from production_test_framework.switch.nvidia.nvidia_cumulus_switch import VIEW_DESCRIPTION, NvidiaCumulusSwitch
 from production_test_framework.switch.nvidia.nvue_paths import INTERFACES_PATH, interface_path
 
-FIXTURES = Path(__file__).parent / "fixtures" / "switch"
+FIXTURES = Path(__file__).parent / "fixtures" / "switch" / "nvidia"
 
 
 @pytest.fixture
@@ -27,7 +27,7 @@ def switch_config() -> NetworkSwitchConfig:
 
 @pytest.fixture
 def interfaces_payload() -> dict:
-    return json.loads((FIXTURES / "nvue_interfaces_description.json").read_text())
+    return json.loads((FIXTURES / "interfaces_description.json").read_text())
 
 
 def test_parse_ports_from_fixture(interfaces_payload: dict) -> None:

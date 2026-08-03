@@ -1,0 +1,249 @@
+# SPDX-License-Identifier: FSL-1.1-ALv2
+# Copyright (c) 2026 Delos Data, Inc.
+
+"""Arista EOS switch driver via eAPI (pyeapi).
+
+Only the commands backing the ``NetworkSwitch`` interface are wrapped:
+
+    status                -> show version, show hostname
+    ports / port          -> show interfaces status
+    vlans / vlan          -> show vlan  (+ show interfaces status for members)
+    lldp_neighbors        -> show lldp neighbors detail
+    set_port_admin_state  -> interface <id> ; [no] shutdown
+    delete_vlan           -> no vlan <id>
+
+Requires eAPI enabled on the switch (``management api http-commands``).
+"""
+
+import logging
+import ssl
+import time
+from typing import Any
+
+import pyeapi
+from pyeapi.eapilib import CommandError, ConnectionError as EapiConnectionError
+
+from production_test_framework.switch.exceptions import SwitchAPIError
+from production_test_framework.switch.models import LldpNeighbor, NetworkSwitchConfig, NetworkSwitchStatus, Port, Vlan
+from production_test_framework.switch.network_switch import NetworkSwitch
+from production_test_framework.switch.port_sort import port_id_sort_key
+
+
+class AristaEosSwitch(NetworkSwitch):
+    """eAPI client for Arista EOS switches."""
+
+    def __init__(self, config: NetworkSwitchConfig) -> None:
+        super().__init__(config)
+        self._logger = logging.getLogger(__name__)
+        self._logger.debug(f"Initializing AristaEosSwitch with config: {config}")
+        # pyeapi's https transport uses an unverified SSL context when none is
+        # passed, so build an explicit context to honour config.verify_tls.
+        if config.verify_tls:
+            context = ssl.create_default_context()
+        else:
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        connection = pyeapi.connect(
+            transport="https",
+            host=config.host,
+            username=config.username,
+            password=config.password,
+            port=config.port,
+            context=context,
+        )
+        self._node = pyeapi.client.Node(connection)
+
+    @property
+    def status(self) -> NetworkSwitchStatus:
+        version = self._run_show("show version")
+        hostname = self._run_show("show hostname")
+        return self._parse_system_status(version, hostname)
+
+    @property
+    def ports(self) -> list[Port]:
+        statuses = self._interface_statuses()
+        return self._parse_ports(statuses)
+
+    @property
+    def vlans(self) -> list[Vlan]:
+        vlan_configs = self._run_show("show vlan").get("vlans", {})
+        statuses = self._interface_statuses()
+        return self._parse_vlans(vlan_configs, statuses)
+
+    @property
+    def lldp_neighbors(self) -> list[LldpNeighbor]:
+        """LLDP neighbors whose advertised port id is a MAC (eAPI: show lldp neighbors detail)."""
+        payload = self._run_show("show lldp neighbors detail").get("lldpNeighbors", {})
+        return self._parse_lldp_neighbors(payload)
+
+    def port(self, port_id: str) -> Port:
+        statuses = self._run_show(f"show interfaces {port_id} status").get("interfaceStatuses", {})
+        body = statuses.get(port_id)
+        if not isinstance(body, dict):
+            raise SwitchAPIError(f"port {port_id} not found")
+        return self._parse_port(port_id, body)
+
+    def vlan(self, vlan_id: str) -> Vlan:
+        try:
+            vlan_configs = self._run_show(f"show vlan {vlan_id}").get("vlans", {})
+        except SwitchAPIError as exc:
+            # EOS returns a command error for an unknown VLAN id.
+            raise SwitchAPIError(f"VLAN {vlan_id} not found") from exc
+        if vlan_id not in vlan_configs:
+            raise SwitchAPIError(f"VLAN {vlan_id} not found")
+        statuses = self._interface_statuses()
+        return self._parse_vlan(vlan_id, vlan_configs[vlan_id], statuses)
+
+    def set_port_admin_state(self, port_id: str, up: bool) -> None:
+        """Administratively enable (up=True) or disable (up=False) a port."""
+        command = "no shutdown" if up else "shutdown"
+        self._run_config([f"interface {port_id}", command])
+
+    def delete_vlan(self, vlan_id: str) -> None:
+        """Remove a VLAN from the switch."""
+        self._run_config([f"no vlan {vlan_id}"])
+
+    # --- eAPI plumbing -------------------------------------------------------
+
+    def _run_show(self, command: str) -> dict[str, Any]:
+        self._logger.debug(f"eAPI show: {command}")
+        try:
+            results = self._node.run_commands([command])
+        except (CommandError, EapiConnectionError) as exc:
+            self._logger.error(f"eAPI command failed: {command}: {exc}")
+            raise SwitchAPIError(f"eAPI command failed: {command}: {exc}") from exc
+        if not results or not isinstance(results[0], dict):
+            raise SwitchAPIError(f"unexpected eAPI response for {command!r}: {results!r}")
+        self._logger.debug(f"eAPI response: {results[0]}")
+        return results[0]
+
+    def _run_config(self, commands: list[str]) -> None:
+        self._logger.debug(f"eAPI config: {commands}")
+        try:
+            self._node.config(commands)
+        except (CommandError, EapiConnectionError) as exc:
+            self._logger.error(f"eAPI config failed: {commands}: {exc}")
+            raise SwitchAPIError(f"eAPI config failed: {commands}: {exc}") from exc
+
+    def _interface_statuses(self) -> dict[str, Any]:
+        return self._run_show("show interfaces status").get("interfaceStatuses", {})
+
+    # --- parsing -------------------------------------------------------------
+
+    @staticmethod
+    def _admin_up(link_status: Any) -> bool | None:
+        if not isinstance(link_status, str):
+            return None
+        # linkStatus is one of: connected / notconnect / disabled / errdisabled
+        return link_status != "disabled"
+
+    @staticmethod
+    def _oper_up(body: dict[str, Any]) -> bool | None:
+        line_proto = body.get("lineProtocolStatus")
+        if isinstance(line_proto, str):
+            return line_proto == "up"
+        link_status = body.get("linkStatus")
+        if isinstance(link_status, str):
+            return link_status == "connected"
+        return None
+
+    def _parse_port(self, port_id: str, body: dict[str, Any]) -> Port:
+        description = body.get("description")
+        if description == "":
+            description = None
+        return Port(
+            id=port_id,
+            admin_up=self._admin_up(body.get("linkStatus")),
+            oper_up=self._oper_up(body),
+            description=description if isinstance(description, str) else None,
+        )
+
+    def _parse_ports(self, statuses: dict[str, Any]) -> list[Port]:
+        ports = [
+            self._parse_port(port_id, body)
+            for port_id, body in statuses.items()
+            if isinstance(body, dict)
+        ]
+        return sorted(ports, key=lambda port: port_id_sort_key(port.id))
+
+    def _member_ports(self, member_ids: list[str], statuses: dict[str, Any]) -> tuple[Port, ...]:
+        ordered = sorted(member_ids, key=port_id_sort_key)
+        return tuple(self._parse_port(pid, statuses.get(pid, {})) for pid in ordered)
+
+    def _parse_vlan(self, vlan_id: str, body: dict[str, Any], statuses: dict[str, Any]) -> Vlan:
+        interfaces = body.get("interfaces", {})
+        member_ids = list(interfaces.keys()) if isinstance(interfaces, dict) else []
+        return Vlan(id=vlan_id, ports=self._member_ports(member_ids, statuses))
+
+    def _parse_vlans(self, vlan_configs: dict[str, Any], statuses: dict[str, Any]) -> list[Vlan]:
+        vlans = [self._parse_vlan(vid, body, statuses) for vid, body in vlan_configs.items()]
+        return sorted(vlans, key=lambda vlan: int(vlan.id) if vlan.id.isdigit() else vlan.id)
+
+    def _parse_lldp_neighbors(self, lldp_neighbors: dict[str, Any]) -> list[LldpNeighbor]:
+        neighbors: list[LldpNeighbor] = []
+        for interface_id, body in lldp_neighbors.items():
+            switch_port = self._interface_name_to_port(interface_id)
+            if switch_port < 0 or not isinstance(body, dict):
+                continue
+            for entry in body.get("lldpNeighborInfo", []):
+                if not isinstance(entry, dict):
+                    continue
+                # chassis_mac carries the neighbor's port/NIC MAC, as the NVIDIA driver does.
+                info = entry.get("neighborInterfaceInfo", {})
+                if not isinstance(info, dict):
+                    continue
+                port_id = info.get("interfaceId", "")
+                if not isinstance(port_id, str):
+                    continue
+                mac = self._normalize_mac(port_id.replace('"', ""))
+                if not mac:
+                    # A non-MAC port id (e.g. an interface name) is expected; skip it.
+                    if info.get("interfaceIdType") == "macAddress":
+                        self._logger.warning(f"lldp_neighbors: invalid MAC {port_id!r} on {interface_id}")
+                    continue
+                neighbors.append(LldpNeighbor(interface=interface_id, switch_port=switch_port, chassis_mac=mac))
+        return sorted(neighbors, key=lambda neighbor: neighbor.switch_port)
+
+    @staticmethod
+    def _interface_name_to_port(interface_id: str) -> int:
+        """Parse "Ethernet14"/"Et14" -> 14 and "Ethernet49/1" -> 49. Returns -1 for non-Ethernet interfaces."""
+        name = interface_id.strip()
+        # Check "Ethernet" before the "Et" abbreviation, since the former also starts with "Et".
+        if name.startswith("Ethernet"):
+            rest = name.removeprefix("Ethernet")
+        elif name.startswith("Et"):
+            rest = name.removeprefix("Et")
+        else:
+            return -1
+        try:
+            port = int(rest.split("/")[0])
+        except ValueError:
+            return -1
+        return port if port >= 0 else -1
+
+    @staticmethod
+    def _normalize_mac(value: str) -> str:
+        """Normalize a MAC (dotted "001c.7300.abcd" or colon form) to lowercase colon form, or "" if invalid."""
+        compact = value.replace(".", "").replace(":", "").lower()
+        if len(compact) != 12:
+            return ""
+        return ":".join(compact[i : i + 2] for i in range(0, 12, 2))
+
+    def _parse_system_status(self, version: dict[str, Any], hostname: dict[str, Any]) -> NetworkSwitchStatus:
+        uptime = version.get("uptime")
+        if uptime is None and "bootupTimestamp" in version:
+            # bootupTimestamp is epoch seconds; derive uptime in seconds.
+            uptime = time.time() - version["bootupTimestamp"]
+        return NetworkSwitchStatus(
+            uptime=uptime,
+            hostname=hostname.get("hostname") or hostname.get("fqdn"),
+            model=version.get("modelName"),
+            serial_number=version.get("serialNumber"),
+            firmware_version=version.get("version"),
+            # FLAG: no uniform eAPI field for ASIC model. Left None; may require
+            # NetworkSwitchStatus.asic_model to be Optional, or a platform-family
+            # lookup (`show platform ...`). See summary.
+            asic_model=None,
+            software_version=version.get("version"),
+        )

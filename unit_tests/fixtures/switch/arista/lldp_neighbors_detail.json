@@ -1,0 +1,44 @@
+{
+  "lldpNeighbors": {
+    "Ethernet1": {
+      "lldpNeighborInfo": [
+        {
+          "chassisIdType": "macAddress",
+          "chassisId": "001c.7300.dead",
+          "neighborInterfaceInfo": {"interfaceIdType": "macAddress", "interfaceId": "0050.5600.0011"},
+          "systemName": "host-a"
+        }
+      ]
+    },
+    "Ethernet3": {
+      "lldpNeighborInfo": [
+        {
+          "chassisIdType": "macAddress",
+          "chassisId": "001c.7300.beef",
+          "neighborInterfaceInfo": {"interfaceIdType": "macAddress", "interfaceId": "AA:BB:CC:00:00:22"},
+          "systemName": "host-b"
+        }
+      ]
+    },
+    "Ethernet5": {
+      "lldpNeighborInfo": [
+        {
+          "chassisIdType": "macAddress",
+          "chassisId": "001c.7300.cafe",
+          "neighborInterfaceInfo": {"interfaceIdType": "interfaceName", "interfaceId": "\"Ethernet19\""},
+          "systemName": "sw-c"
+        }
+      ]
+    },
+    "Management1": {
+      "lldpNeighborInfo": [
+        {
+          "chassisIdType": "macAddress",
+          "chassisId": "001c.7300.0099",
+          "neighborInterfaceInfo": {"interfaceIdType": "macAddress", "interfaceId": "0050.5600.0099"},
+          "systemName": "mgmt"
+        }
+      ]
+    }
+  }
+}
