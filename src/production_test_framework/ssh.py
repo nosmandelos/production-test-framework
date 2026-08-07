@@ -136,8 +136,24 @@ def wait_for_ssh_password_login(
 class SSHExecutor:
     """Execute commands on remote hosts via Paramiko SSH."""
 
-    def __init__(self, config: LGTMConfig):
+    def __init__(
+        self,
+        config: LGTMConfig,
+        *,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+    ):
+        """
+        Args:
+            config: Provides the default host and the Ansible remote user.
+            username: SSH user, overriding config.ansible_remote_user.
+            password: SSH password. When given, key and agent auth are disabled
+                so only the password is used - appliances such as lab switches
+                accept nothing else. Omit it to keep the default key/agent auth.
+        """
         self.config = config
+        self.username = username or config.ansible_remote_user
+        self.password = password
         self._client: Optional[paramiko.SSHClient] = None
         self._current_host: Optional[str] = None
 
@@ -175,9 +191,10 @@ class SSHExecutor:
         try:
             client.connect(
                 hostname=host,
-                username=self.config.ansible_remote_user,
-                allow_agent=True,
-                look_for_keys=True,
+                username=self.username,
+                password=self.password,
+                allow_agent=self.password is None,
+                look_for_keys=self.password is None,
                 timeout=30,
             )
             self._client = client

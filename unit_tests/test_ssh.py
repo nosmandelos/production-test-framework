@@ -54,6 +54,46 @@ class TestSSHExecutor:
         mock_client.exec_command.assert_called_once_with("echo hello", timeout=60)
 
     @patch("production_test_framework.ssh.paramiko.SSHClient")
+    def test_connect_defaults_to_key_auth(self, mock_ssh_cls, lgtm_config):
+        mock_client = MagicMock()
+        mock_ssh_cls.return_value = mock_client
+        mock_stdout = MagicMock()
+        mock_stdout.read.return_value = b""
+        mock_stderr = MagicMock()
+        mock_stderr.read.return_value = b""
+        mock_stdout.channel.recv_exit_status.return_value = 0
+        mock_client.exec_command.return_value = (MagicMock(), mock_stdout, mock_stderr)
+
+        SSHExecutor(lgtm_config).run("echo ok")
+
+        kwargs = mock_client.connect.call_args.kwargs
+        assert kwargs["username"] == lgtm_config.ansible_remote_user
+        assert kwargs["password"] is None
+        assert kwargs["allow_agent"] is True
+        assert kwargs["look_for_keys"] is True
+
+    @patch("production_test_framework.ssh.paramiko.SSHClient")
+    def test_connect_with_password_disables_key_auth(self, mock_ssh_cls, lgtm_config):
+        mock_client = MagicMock()
+        mock_ssh_cls.return_value = mock_client
+        mock_stdout = MagicMock()
+        mock_stdout.read.return_value = b""
+        mock_stderr = MagicMock()
+        mock_stderr.read.return_value = b""
+        mock_stdout.channel.recv_exit_status.return_value = 0
+        mock_client.exec_command.return_value = (MagicMock(), mock_stdout, mock_stderr)
+
+        executor = SSHExecutor(lgtm_config, username="cumulus", password="pw")
+        executor.run("echo ok", host="switch-1")
+
+        kwargs = mock_client.connect.call_args.kwargs
+        assert kwargs["hostname"] == "switch-1"
+        assert kwargs["username"] == "cumulus"
+        assert kwargs["password"] == "pw"
+        assert kwargs["allow_agent"] is False
+        assert kwargs["look_for_keys"] is False
+
+    @patch("production_test_framework.ssh.paramiko.SSHClient")
     def test_run_connection_error_returns_command_result(self, mock_ssh_cls, lgtm_config):
         mock_ssh_cls.return_value = MagicMock()
         mock_ssh_cls.return_value.connect.side_effect = Exception("Connection refused")

@@ -23,6 +23,7 @@ class LGTMConfig:
 
     grafana_port: int = 3000
     mimir_port: int = 9009
+    loki_port: int = 3100
     otlp_grpc_port: int = 4317
     otlp_http_port: int = 4318
 

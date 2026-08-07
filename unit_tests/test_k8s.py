@@ -12,6 +12,7 @@ from production_test_framework.config import LGTMConfig
 from production_test_framework.k8s import (
     Node,
     Pod,
+    KubectlPortForwarder,
     KubernetesClient,
     LocalKubectlPortForwarder,
     LocalPortForward,
@@ -297,6 +298,101 @@ class TestKubernetesClientLocalhost:
             client.get_namespaces()
             mock_ssh.run_kubectl.assert_not_called()
             mock_run.assert_called_once()
+
+
+class TestKubectlPortForwarder:
+    """Tests for the SSH-based KubectlPortForwarder with a mocked SSHExecutor."""
+
+    @staticmethod
+    def _ssh_mock(listening_port: int | None) -> MagicMock:
+        """SSHExecutor stub whose `ss -ltn` reports listening_port bound, if any."""
+        ssh = MagicMock()
+
+        def run(command: str, *args, **kwargs) -> CommandResult:
+            if command.startswith("ss -ltn"):
+                stdout = f"LISTEN 0 4096 127.0.0.1:{listening_port} 0.0.0.0:*" if listening_port else ""
+                return CommandResult(returncode=0, stdout=stdout, stderr="")
+            if command.startswith("tail"):
+                return CommandResult(returncode=0, stdout="error: services 'mimir-gateway' not found", stderr="")
+            return CommandResult(returncode=0, stdout="12345", stderr="")
+
+        ssh.run.side_effect = run
+        return ssh
+
+    def test_start_service_tunnel_waits_for_remote_bind(self):
+        ssh = self._ssh_mock(listening_port=9009)
+        forwarder = KubectlPortForwarder(ssh)
+
+        with patch.object(forwarder, "_start_ssh_tunnel", return_value=True) as mock_tunnel:
+            assert forwarder.start_service_tunnel(
+                local_port=9009,
+                service_name="mimir-gateway",
+                service_port=80,
+                namespace="lgtma",
+                use_sudo=False,
+            )
+
+        commands = [c.args[0] for c in ssh.run.call_args_list]
+        kubectl = next(c for c in commands if "port-forward" in c)
+        assert "kubectl -n lgtma port-forward svc/mimir-gateway 9009:80" in kubectl
+        assert not kubectl.startswith("sudo"), "use_sudo=False must not prepend sudo"
+        assert any(c.startswith("ss -ltn") for c in commands), "must verify the remote port is bound"
+        mock_tunnel.assert_called_once()
+        assert 12345 in forwarder._kubectl_pids
+
+    @patch("production_test_framework.helper.time.sleep")
+    def test_start_service_tunnel_fails_when_remote_never_binds(self, mock_sleep):
+        # kubectl exits immediately (wrong namespace, missing service): nothing
+        # ever listens, so the tunnel must be reported as failed rather than
+        # handed back broken.
+        ssh = self._ssh_mock(listening_port=None)
+        forwarder = KubectlPortForwarder(ssh)
+
+        with patch.object(forwarder, "_start_ssh_tunnel", return_value=True) as mock_tunnel:
+            assert not forwarder.start_service_tunnel(
+                local_port=9009,
+                service_name="mimir-gateway",
+                service_port=80,
+                namespace="mosaic",
+                ready_timeout=1.0,
+            )
+
+        mock_tunnel.assert_not_called()
+
+    def test_start_service_tunnel_proceeds_when_ss_is_unavailable(self):
+        # A host without iproute2 cannot be probed; that must not fail every
+        # tunnel, so an unusable probe falls back to the previous behavior.
+        ssh = MagicMock()
+        ssh.run.side_effect = lambda command, *a, **kw: (
+            CommandResult(returncode=127, stdout="", stderr="ss: command not found")
+            if command.startswith("ss -ltn")
+            else CommandResult(returncode=0, stdout="12345", stderr="")
+        )
+        forwarder = KubectlPortForwarder(ssh)
+
+        with patch.object(forwarder, "_start_ssh_tunnel", return_value=True) as mock_tunnel:
+            assert forwarder.start_service_tunnel(
+                local_port=9009,
+                service_name="mimir-gateway",
+                service_port=80,
+                ready_timeout=1.0,
+            )
+
+        mock_tunnel.assert_called_once()
+
+    def test_start_service_tunnel_can_skip_the_readiness_wait(self):
+        ssh = self._ssh_mock(listening_port=None)
+        forwarder = KubectlPortForwarder(ssh)
+
+        with patch.object(forwarder, "_start_ssh_tunnel", return_value=True):
+            assert forwarder.start_service_tunnel(
+                local_port=9009,
+                service_name="mimir-gateway",
+                service_port=80,
+                wait_ready=False,
+            )
+
+        assert not any(c.args[0].startswith("ss -ltn") for c in ssh.run.call_args_list)
 
 
 class TestLocalKubectlPortForwarder:

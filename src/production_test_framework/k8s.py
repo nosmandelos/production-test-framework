@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from production_test_framework.config import LGTMConfig
-from production_test_framework.helper import is_localhost, run_command
+from production_test_framework.helper import is_localhost, poll_until, run_command
 from production_test_framework.ssh import SSHExecutor, CommandResult
 
 
@@ -409,6 +409,19 @@ class KubectlPortForwarder:
         except Exception:
             return False
 
+    def _wait_for_remote_listener(self, port: int, timeout: float) -> bool:
+        """Poll the remote host until something is listening on 127.0.0.1:port."""
+
+        def listening() -> bool:
+            result = self._ssh.run(f"ss -ltn 'sport = :{port}'")
+            if not result.success:
+                # No usable `ss` on the host: the bind cannot be verified, so let
+                # the caller proceed rather than failing a tunnel that may be fine.
+                return True
+            return f":{port}" in result.stdout
+
+        return poll_until(listening, timeout=timeout, interval=0.5)
+
     def start_service_tunnel(
         self,
         local_port: int,
@@ -417,6 +430,8 @@ class KubectlPortForwarder:
         namespace: str = "default",
         remote_kubectl_port: int = 0,
         use_sudo: bool = True,
+        wait_ready: bool = True,
+        ready_timeout: float = 10.0,
     ) -> bool:
         """
         Start a kubectl port-forward and SSH tunnel to a Kubernetes service.
@@ -429,6 +444,8 @@ class KubectlPortForwarder:
             remote_kubectl_port: Port on remote host for kubectl to bind to.
                                 If 0, uses local_port value.
             use_sudo: Whether to use sudo for kubectl (default: True)
+            wait_ready: Wait for kubectl to bind the remote port (default: True)
+            ready_timeout: Timeout in seconds to wait for ready (default: 10.0)
 
         Returns:
             True if both kubectl port-forward and SSH tunnel started successfully
@@ -452,8 +469,12 @@ class KubectlPortForwarder:
         if use_sudo:
             kubectl_cmd = f"sudo {kubectl_cmd}"
 
+        # Keep kubectl's own output: it is the only explanation of a failure to
+        # bind (missing service, wrong namespace, no kubeconfig permission).
+        log_path = f"/tmp/kubectl-port-forward-{remote_kubectl_port}.log"
+
         # Run kubectl port-forward in background and capture PID
-        bg_cmd = f"nohup {kubectl_cmd} > /dev/null 2>&1 & echo $!"
+        bg_cmd = f"nohup {kubectl_cmd} > {log_path} 2>&1 & echo $!"
         result = self._ssh.run(bg_cmd)
 
         if not result.success:
@@ -465,6 +486,20 @@ class KubectlPortForwarder:
             self._kubectl_pids.append(pid)
         except ValueError:
             pass
+
+        # `nohup ... &` returns as soon as the shell forks, well before kubectl
+        # binds the port. Without waiting here the SSH tunnel below comes up over
+        # nothing, start_service_tunnel reports success, and the caller's first
+        # request dies with "connection reset by peer" instead of a tunnel error.
+        if wait_ready and not self._wait_for_remote_listener(remote_kubectl_port, ready_timeout):
+            print(
+                f"  kubectl port-forward did not bind 127.0.0.1:{remote_kubectl_port} "
+                f"on the remote host within {ready_timeout}s"
+            )
+            log = self._ssh.run(f"tail -n 5 {log_path}")
+            if log.stdout:
+                print(f"  kubectl output:\n{log.stdout}")
+            return False
 
         # Start SSH tunnel from local port to remote kubectl port
         return self._start_ssh_tunnel(

@@ -11,7 +11,7 @@ import socket
 import subprocess
 import threading
 import time
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import requests
 
@@ -168,6 +168,38 @@ def run_cancellable_command(
             return CommandResult(returncode=-1, stdout="", stderr=str(e))
 
 
+def poll_until(
+    predicate: Callable[[], bool],
+    *,
+    timeout: float = 30.0,
+    interval: float = 1.0,
+) -> bool:
+    """
+    Poll predicate until it returns True or timeout elapses.
+
+    The generic form of the wait_for_* helpers below, for waiting on state a test
+    cannot observe synchronously (a controller reconciling, a switch applying a
+    change, telemetry reaching a backend).
+
+    predicate is evaluated once immediately, so a condition that is already true
+    costs nothing.
+
+    Args:
+        predicate: Condition to poll; must be safe to call repeatedly.
+        timeout: Total seconds to keep retrying.
+        interval: Seconds between attempts.
+
+    Returns:
+        The last value predicate returned, so callers can assert on it directly.
+    """
+    deadline = time.monotonic() + timeout
+    result = predicate()
+    while not result and time.monotonic() < deadline:
+        time.sleep(interval)
+        result = predicate()
+    return result
+
+
 def check_tcp_connectivity(host: str, port: int, timeout: float = 5.0) -> bool:
     """
     Test TCP connectivity to a host:port.
@@ -263,5 +295,28 @@ def query_mimir(mimir_port: int, endpoint: str, params: dict = None, timeout: in
         requests.Response object
     """
     base_url = get_mimir_base_url(mimir_port)
+    url = f"{base_url}{endpoint}"
+    return requests.get(url, params=params, timeout=timeout)
+
+
+def get_loki_base_url(loki_port: int) -> str:
+    """Get the base URL for the Loki HTTP API."""
+    return f"http://localhost:{loki_port}"
+
+
+def query_loki(loki_port: int, endpoint: str, params: dict = None, timeout: int = 10) -> requests.Response:
+    """
+    Query the Loki HTTP API.
+
+    Args:
+        loki_port: Local port where Loki is accessible
+        endpoint: API endpoint (e.g., "/loki/api/v1/query_range")
+        params: Optional query parameters
+        timeout: Request timeout in seconds
+
+    Returns:
+        requests.Response object
+    """
+    base_url = get_loki_base_url(loki_port)
     url = f"{base_url}{endpoint}"
     return requests.get(url, params=params, timeout=timeout)
