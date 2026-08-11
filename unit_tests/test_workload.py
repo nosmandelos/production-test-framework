@@ -12,8 +12,34 @@ import pytest
 from production_test_framework.ssh import CommandResult
 from production_test_framework.vllm import InferenceResult
 from production_test_framework.workload.inferencex_workload import InferencexWorkload
+from production_test_framework.workload.nccl_workload import (
+    NcclTest,
+    NcclWorkload,
+    parse_nccl_output,
+)
 from production_test_framework.workload.prompt_workload import BACKEND_TYPE, PromptWorkload
 from production_test_framework.workload.workload import Workload, WorkloadStatus
+
+NCCL_ALL_REDUCE_OUTPUT = """\
+# nThread 1 nGpus 8 minBytes 8 maxBytes 268435456 step: 2(factor) warmup iters: 5 iters: 20 validation: 1
+#
+#                                                              out-of-place                       in-place
+#       size         count      type   redop    root     time   algbw   busbw #wrong     time   algbw   busbw #wrong
+#        (B)    (elements)                               (us)  (GB/s)  (GB/s)            (us)  (GB/s)  (GB/s)
+           8             2     float     sum      -1    23.45    0.00    0.00      0    22.11    0.00    0.00      0
+   268435456      67108864     float     sum      -1  1234.50  217.45  380.54      0  1230.10  218.22  381.89      0
+# Out of bounds values : 0 OK
+# Avg bus bandwidth    : 190.715
+#
+"""
+
+NCCL_ALL_GATHER_OUTPUT = """\
+#       size         count      type     time   algbw   busbw #wrong     time   algbw   busbw #wrong
+#        (B)    (elements)               (us)  (GB/s)  (GB/s)            (us)  (GB/s)  (GB/s)
+   134217728       2097152     float   500.10  268.38  234.83    N/A   498.00  269.51  235.82    N/A
+# Out of bounds values : 0 OK
+# Avg bus bandwidth    : 235.325
+"""
 
 
 class TestWorkloadStatus:
@@ -141,7 +167,7 @@ class TestInferencexWorkload:
     @pytest.fixture
     def mock_inferencex_run(self):
         with patch(
-            "production_test_framework.workload.inferencex_workload.run_cancellable_command",
+            "production_test_framework.workload.command_workload.run_cancellable_command",
         ) as m:
             m.return_value = CommandResult(
                 returncode=0,
@@ -248,6 +274,291 @@ class TestInferencexWorkload:
             RuntimeError,
             match="Inferencex workload already running",
         ):
+            w.start()
+        block.set()
+        w._completion_fut.result(timeout=10.0)
+        w.shutdown_executor(wait=True)
+
+
+class TestNcclOutputParsing:
+    """Tests for the nccl-tests output parser."""
+
+    def test_parses_samples_and_summary(self):
+        result = parse_nccl_output(NCCL_ALL_REDUCE_OUTPUT, test="all_reduce_perf")
+        assert result.test == "all_reduce_perf"
+        assert result.avg_bus_bandwidth_gbps == 190.715
+        assert result.out_of_bounds_errors == 0
+        # two data rows x (out-of-place, in-place)
+        assert len(result.samples) == 4
+        largest = [s for s in result.samples if s.size_bytes == 268435456]
+        assert {s.in_place for s in largest} == {True, False}
+        out_of_place = next(s for s in largest if not s.in_place)
+        assert out_of_place.count == 67108864
+        assert out_of_place.dtype == "float"
+        assert out_of_place.time_us == 1234.50
+        assert out_of_place.algbw_gbps == 217.45
+        assert out_of_place.busbw_gbps == 380.54
+        assert out_of_place.wrong == 0
+
+    def test_max_busbw_and_passed(self):
+        result = parse_nccl_output(NCCL_ALL_REDUCE_OUTPUT)
+        assert result.max_busbw_gbps == 381.89
+        assert result.passed is True
+
+    def test_parses_rows_without_redop_and_root_columns(self):
+        result = parse_nccl_output(NCCL_ALL_GATHER_OUTPUT, test="all_gather_perf")
+        assert len(result.samples) == 2
+        assert result.avg_bus_bandwidth_gbps == 235.325
+        assert result.max_busbw_gbps == 235.82
+        # validation disabled -> "N/A" is not an error
+        assert all(s.wrong is None for s in result.samples)
+        assert result.passed is True
+
+    def test_out_of_bounds_errors_fail_the_run(self):
+        output = NCCL_ALL_REDUCE_OUTPUT.replace("# Out of bounds values : 0 OK", "# Out of bounds values : 2 FAILED")
+        result = parse_nccl_output(output)
+        assert result.out_of_bounds_errors == 2
+        assert result.passed is False
+
+    def test_empty_output_has_no_samples_and_does_not_pass(self):
+        result = parse_nccl_output("")
+        assert result.samples == []
+        assert result.avg_bus_bandwidth_gbps is None
+        assert result.passed is False
+
+
+class TestNcclWorkload:
+    """Tests for NCCL test workload."""
+
+    @pytest.fixture
+    def mock_nccl_run(self):
+        with patch(
+            "production_test_framework.workload.command_workload.run_cancellable_command",
+        ) as m:
+            m.return_value = CommandResult(
+                returncode=0,
+                stdout=NCCL_ALL_REDUCE_OUTPUT,
+                stderr="",
+            )
+            yield m
+
+    def test_is_workload_subclass(self):
+        assert issubclass(NcclWorkload, Workload)
+
+    def test_initial_status_is_stopped(self):
+        w = NcclWorkload()
+        assert w.status == WorkloadStatus.STOPPED
+        assert w.get_result().result is None
+
+    def test_default_command_runs_binary_in_container(self):
+        w = NcclWorkload()
+        cmd = w.build_command()
+        assert cmd[:2] == ["docker", "run"]
+        assert "--gpus" in cmd and "all" in cmd
+        assert "openmosaic/mosaic-nccl-tests:latest" in cmd
+        assert "/workspace/bin/all_reduce_perf" in cmd
+        assert "mpirun" not in cmd
+        # single-node run drives every GPU from one process
+        assert cmd[cmd.index("-g") + 1] == "8"
+
+    def test_containerised_run_requires_an_image(self):
+        with pytest.raises(ValueError, match="requires image_name"):
+            NcclWorkload(use_docker=True, image_name=None)
+
+        w = NcclWorkload(image_name="registry.local/nccl-tests:v2.13")
+        assert "registry.local/nccl-tests:v2.13" in w.build_command()
+
+    def test_runs_binary_directly_without_docker(self):
+        w = NcclWorkload(use_docker=False, image_name=None)
+        cmd = w.build_command()
+        assert cmd[0] == "/workspace/bin/all_reduce_perf"
+        assert "docker" not in cmd
+
+    def test_gpus_defaults_to_all(self):
+        w = NcclWorkload()
+        cmd = w.build_command()
+        assert cmd[cmd.index("--gpus") + 1] == "all"
+
+    def test_gpu_selection_is_quoted_for_dockers_csv_parser(self):
+        # Bare "device=2,3" is split on the comma and rejected by dockerd with
+        # "cannot set both Count and DeviceIDs on device request".
+        w = NcclWorkload(gpus="device=2,3", gpus_per_host=2)
+        assert w.gpus == '"device=2,3"'
+        cmd = w.build_command()
+        assert cmd[cmd.index("--gpus") + 1] == '"device=2,3"'
+        # GPUs are renumbered from 0 in the container, so -g counts them
+        assert cmd[cmd.index("-g") + 1] == "2"
+
+    def test_single_gpu_selection_needs_no_quoting(self):
+        assert NcclWorkload(gpus="device=2").gpus == "device=2"
+        assert NcclWorkload(gpus="2").gpus == "2"
+
+    def test_already_quoted_gpu_selection_is_left_alone(self):
+        assert NcclWorkload(gpus='"device=0,1"').gpus == '"device=0,1"'
+
+    def test_network_defaults_to_bridge_so_the_image_finds_eth0(self):
+        # The image sets NCCL_SOCKET_IFNAME=eth0; --network host has no eth0 and NCCL's
+        # bootstrap aborts with "no socket interface found".
+        w = NcclWorkload()
+        assert w.docker_network == "bridge"
+        cmd = w.build_command()
+        assert cmd[cmd.index("--network") + 1] == "bridge"
+
+    def test_network_defaults_to_host_under_mpirun(self):
+        w = NcclWorkload(hosts=("gpu01", "gpu02"))
+        assert w.docker_network == "host"
+        cmd = w.build_command()
+        assert cmd[cmd.index("--network") + 1] == "host"
+
+    def test_network_can_be_overridden(self):
+        w = NcclWorkload(docker_network="my-net")
+        assert w.docker_network == "my-net"
+        assert w.build_command()[w.build_command().index("--network") + 1] == "my-net"
+
+    def test_test_selection_and_sizes(self):
+        w = NcclWorkload(
+            test=NcclTest.ALL_GATHER,
+            binary_dir="/usr/local/nccl-tests/build/",
+            min_bytes="1M",
+            max_bytes="4G",
+            step_factor=4,
+            iters=50,
+            warmup_iters=10,
+            check=False,
+            test_extra_args=("-z", "1"),
+        )
+        # Read the flags from the binary onwards: `docker run` takes its own -e (env), which
+        # would otherwise shadow the test binary's -e (max bytes).
+        full = w.build_command()
+        assert "/usr/local/nccl-tests/build/all_gather_perf" in full
+        cmd = full[full.index("/usr/local/nccl-tests/build/all_gather_perf") :]
+        assert cmd[cmd.index("-b") + 1] == "1M"
+        assert cmd[cmd.index("-e") + 1] == "4G"
+        assert cmd[cmd.index("-f") + 1] == "4"
+        assert cmd[cmd.index("-n") + 1] == "50"
+        assert cmd[cmd.index("-w") + 1] == "10"
+        assert cmd[cmd.index("-c") + 1] == "0"
+        assert cmd[-2:] == ["-z", "1"]
+
+    def test_hosts_switch_the_run_to_mpirun_with_one_gpu_per_rank(self):
+        w = NcclWorkload(
+            hosts=("gpu01", "gpu02"),
+            gpus_per_host=4,
+            env={"NCCL_DEBUG": "INFO"},
+            mpi_extra_args=("--mca", "btl", "tcp,self"),
+        )
+        assert w.use_mpi is True
+        assert w.num_processes == 8
+        cmd = w.build_command()
+        # mpirun is the launcher inside the container, so it follows the image name
+        assert cmd[cmd.index("openmosaic/mosaic-nccl-tests:latest") + 1] == "mpirun"
+        assert cmd[cmd.index("-np") + 1] == "8"
+        assert cmd[cmd.index("-H") + 1] == "gpu01:4,gpu02:4"
+        assert cmd[cmd.index("-x") + 1] == "NCCL_DEBUG=INFO"
+        assert "--mca" in cmd
+        assert cmd[cmd.index("-g") + 1] == "1"
+
+    def test_single_host_still_launches_under_mpirun(self):
+        w = NcclWorkload(hosts=("gpu01",), gpus_per_host=8, use_docker=False, image_name=None)
+        assert w.use_mpi is True
+        cmd = w.build_command()
+        assert cmd[0] == "mpirun"
+        assert cmd[cmd.index("-np") + 1] == "8"
+        assert cmd[cmd.index("-H") + 1] == "gpu01:8"
+        assert cmd[cmd.index("-g") + 1] == "1"
+
+    def test_no_hosts_means_no_mpirun(self):
+        w = NcclWorkload(gpus_per_host=8)
+        assert w.use_mpi is False
+        assert w.hosts == ()
+        assert "mpirun" not in w.build_command()
+        # one process drives all 8 GPUs, so the process count is 1 -- not 0, not 8
+        assert w.num_processes == 1
+
+    def test_num_processes_override(self):
+        w = NcclWorkload(hosts=("gpu01",), gpus_per_host=8, num_processes=2)
+        assert w.num_processes == 2
+        assert w.build_command()[w.build_command().index("-np") + 1] == "2"
+
+    def test_env_is_passed_to_container_and_mpirun(self):
+        w = NcclWorkload(
+            hosts=("gpu01",),
+            env={"NCCL_IB_DISABLE": "0"},
+            use_docker=True,
+            image_name="registry.local/nccl-tests:v2.13",
+        )
+        cmd = w.build_command()
+        assert cmd[cmd.index("-e") + 1] == "NCCL_IB_DISABLE=0"
+        assert cmd[cmd.index("-x") + 1] == "NCCL_IB_DISABLE=0"
+
+    def test_get_result_after_completion_is_parsed(self, mock_nccl_run):
+        w = NcclWorkload()
+        w.start()
+        w._completion_fut.result(timeout=10.0)
+        assert w.status == WorkloadStatus.COMPLETED
+        result = w.get_result()
+        assert result.status == WorkloadStatus.COMPLETED
+        assert result.result.test == "all_reduce_perf"
+        assert result.result.avg_bus_bandwidth_gbps == 190.715
+        assert result.result.passed is True
+        assert result.runtime is not None
+        w.shutdown_executor(wait=True)
+
+    def test_parses_table_from_stderr_when_stdout_empty(self, mock_nccl_run):
+        mock_nccl_run.return_value = CommandResult(
+            returncode=0,
+            stdout="",
+            stderr=NCCL_ALL_REDUCE_OUTPUT,
+        )
+        w = NcclWorkload()
+        w.start()
+        w._completion_fut.result(timeout=10.0)
+        assert w.get_result().result.avg_bus_bandwidth_gbps == 190.715
+        w.shutdown_executor(wait=True)
+
+    def test_failed_run_sets_error_status(self, mock_nccl_run):
+        mock_nccl_run.return_value = CommandResult(
+            returncode=1,
+            stdout="",
+            stderr="NCCL failure: unhandled system error",
+        )
+        w = NcclWorkload()
+        w.start()
+        assert w.wait_for_completion(timeout=10.0, poll_interval=0.05) is True
+        assert w.status == WorkloadStatus.ERROR
+        assert "unhandled system error" in w.get_result().result
+        w.shutdown_executor(wait=True)
+
+    def test_stop_cancels_and_clears_result(self, mock_nccl_run):
+        def run_until_cancel(cmd, *, timeout, cancel_event, **kwargs):
+            for _ in range(500):
+                if cancel_event.is_set():
+                    return CommandResult(returncode=-1, stdout="", stderr="cancelled")
+                time.sleep(0.01)
+            return CommandResult(returncode=0, stdout=NCCL_ALL_REDUCE_OUTPUT, stderr="")
+
+        mock_nccl_run.side_effect = run_until_cancel
+        w = NcclWorkload()
+        w.start()
+        time.sleep(0.05)
+        w.stop()
+        assert mock_nccl_run.call_args[1]["cancel_event"].is_set()
+        assert w.status == WorkloadStatus.STOPPED
+        assert w.get_result().result is None
+        w.shutdown_executor(wait=True)
+
+    def test_second_start_raises_when_already_running(self, mock_nccl_run):
+        block = threading.Event()
+
+        def slow_run(*_args, **_kwargs):
+            block.wait(timeout=60.0)
+            return CommandResult(returncode=0, stdout=NCCL_ALL_REDUCE_OUTPUT, stderr="")
+
+        mock_nccl_run.side_effect = slow_run
+        w = NcclWorkload()
+        w.start()
+        assert w.status == WorkloadStatus.RUNNING
+        with pytest.raises(RuntimeError, match="NCCL workload already running"):
             w.start()
         block.set()
         w._completion_fut.result(timeout=10.0)
