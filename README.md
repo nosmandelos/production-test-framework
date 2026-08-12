@@ -37,6 +37,7 @@ vendor-neutral:
 | Kubernetes | `kubectl` CLI over SSH / locally | (kubectl) |
 | Network switches | **NVUE REST API** (open, documented) | `requests` |
 | Inference | OpenAI-compatible HTTP (vLLM) | `requests` |
+| GPU collectives benchmarking | `nccl-tests` CLI + MPI launcher (`mpirun`) | (nccl-tests / Open MPI) |
 | Telemetry | OTLP over gRPC (OpenTelemetry) | `opentelemetry-*` |
 | Metrics query | Prometheus/Mimir HTTP API | `requests` |
 | Configuration mgmt | Ansible playbooks | `ansible-core` |
@@ -78,7 +79,7 @@ Importable API under `production_test_framework`:
 | `k8s` | `KubernetesClient`, `KubectlPortForwarder`, `LocalKubectlPortForwarder`, `Node`, `Pod` |
 | `vllm` | `VllmClient`, `VllmConfig`, `InferenceResult` |
 | `switch` | `NetworkSwitch` (ABC), `create_switch`, `SwitchType`, `NvidiaCumulusSwitch` (NVUE driver), `SwitchAPIError` |
-| `workload` | `Workload` (ABC), `PromptWorkload`, `InferencexWorkload`, `WorkloadResult` |
+| `workload` | `Workload` (ABC), `CommandWorkload` (ABC), `PromptWorkload`, `InferencexWorkload`, `NcclWorkload`, `NcclTest`, `NcclTestResult`, `WorkloadResult` |
 | `telemetry` | `Otelp`, `OtelpConfig`, `create_otelp` |
 | `loadgen` | `LocustMetricsUser`, `LocustTestConfig`, `run_locust_test` |
 | `utils` | `wait_for` (generic polling) |
