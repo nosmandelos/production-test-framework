@@ -11,7 +11,13 @@ import pytest
 
 from production_test_framework.ssh import CommandResult
 from production_test_framework.vllm import InferenceResult
-from production_test_framework.workload.inferencex_workload import InferencexWorkload
+from production_test_framework.workload.inferencex_workload import (
+    DEFAULT_BENCHMARK_OPTIONS,
+    InferencexBenchmarkResult,
+    InferencexWorkload,
+    benchmark_option_argv,
+    parse_benchmark_serving_output,
+)
 from production_test_framework.workload.nccl_workload import (
     NcclTest,
     NcclWorkload,
@@ -39,6 +45,36 @@ NCCL_ALL_GATHER_OUTPUT = """\
    134217728       2097152     float   500.10  268.38  234.83    N/A   498.00  269.51  235.82    N/A
 # Out of bounds values : 0 OK
 # Avg bus bandwidth    : 235.325
+"""
+
+# Faithful to benchmark_serving.py's own print formatting (benchmark_serving.py:684-759).
+# The first value keeps its literal "{:<10}" padding, written as \x20 so linters do not
+# strip it -- real output is padded and the parser has to tolerate it.
+BENCHMARK_SERVING_OUTPUT = """\
+Starting main benchmark run...
+Traffic request rate: inf
+Maximum request concurrency: 8
+============ Serving Benchmark Result ============
+Successful requests:                     64\x20\x20\x20\x20\x20\x20\x20\x20
+Benchmark duration (s):                  42.17
+Total input tokens:                      32768
+Total generated tokens:                  4096
+Request throughput (req/s):              1.52
+Output token throughput (tok/s):         97.13
+Total Token throughput (tok/s):          874.21
+---------------Time to First Token----------------
+Mean TTFT (ms):                          128.44
+Median TTFT (ms):                        119.02
+P90 TTFT (ms):                           201.55
+P99 TTFT (ms):                           288.31
+P99.9 TTFT (ms):                         301.77
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          18.22
+Median TPOT (ms):                        17.90
+P90 TPOT (ms):                           22.41
+P99 TPOT (ms):                           25.03
+P99.9 TPOT (ms):                         26.10
+==================================================
 """
 
 
@@ -209,7 +245,7 @@ class TestInferencexWorkload:
         assert fut is not None
         fut.result(timeout=10.0)
         assert w.status == WorkloadStatus.COMPLETED
-        assert w.get_result().result == "benchmark output\n"
+        assert w.get_result().result.raw_output == "benchmark output\n"
         assert w.get_result().status == WorkloadStatus.COMPLETED
         assert w.get_result().start_time is not None
         assert w.get_result().end_time is not None
@@ -219,8 +255,7 @@ class TestInferencexWorkload:
     def test_docker_exec_argv_includes_container_host_port(self, mock_inferencex_run):
         w = InferencexWorkload(
             container_name="mycontainer",
-            vllm_host="vllm.svc",
-            vllm_port=9090,
+            benchmark_options={"host": "vllm.svc", "port": 9090},
         )
         w.start()
         w._completion_fut.result(timeout=10.0)
@@ -248,11 +283,11 @@ class TestInferencexWorkload:
         w.stop()
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
-            if w.status == WorkloadStatus.STOPPED and w.get_result() == "":
+            if w.status == WorkloadStatus.STOPPED and w.get_result().result is None:
                 break
             time.sleep(0.02)
         assert w.status == WorkloadStatus.STOPPED
-        assert w.get_result().result == ""
+        assert w.get_result().result is None
         assert w.get_result().status == WorkloadStatus.STOPPED
         assert w.get_result().start_time is not None
         assert w.get_result().end_time is not None
@@ -278,6 +313,232 @@ class TestInferencexWorkload:
         block.set()
         w._completion_fut.result(timeout=10.0)
         w.shutdown_executor(wait=True)
+
+
+# Exactly what InferencexWorkload(docker_exec_timeout=...) emitted before the option surface was
+# added. Frozen on purpose: mosaic's only call site passes nothing else, so any drift here is a
+# breaking change to a consumer rather than a test that needs updating.
+LEGACY_INFERENCEX_COMMAND = [
+    "docker",
+    "run",
+    "--rm",
+    "-t",
+    "--network",
+    "host",
+    "--name",
+    "inferencex",
+    "openmosaic/inferencex:latest",
+    "python3",
+    "/workspace/InferenceX/utils/bench_serving/benchmark_serving.py",
+    "--host",
+    "localhost",
+    "--port",
+    "8080",
+    "--model",
+    "Qwen/Qwen3-8B",
+    "--backend",
+    "vllm",
+    "--dataset-name",
+    "random",
+]
+
+
+class TestInferencexCommand:
+    """Tests for the InferenceX argv construction."""
+
+    def test_default_command_matches_legacy_argv(self):
+        assert InferencexWorkload(docker_exec_timeout=1200).build_command() == LEGACY_INFERENCEX_COMMAND
+
+    def test_empty_options_emit_no_extra_flags(self):
+        assert InferencexWorkload(benchmark_options={}).build_command() == LEGACY_INFERENCEX_COMMAND
+
+    def test_options_layer_over_the_defaults(self):
+        cmd = InferencexWorkload(benchmark_options={"model": "other/model"}).build_command()
+        assert cmd[cmd.index("--model") + 1] == "other/model"
+        assert cmd.count("--model") == 1
+        # Untouched defaults survive.
+        assert cmd[cmd.index("--host") + 1] == "localhost"
+
+    def test_none_drops_a_default(self):
+        # This is how a disagg target replaces host/port with a single frontend URL.
+        cmd = InferencexWorkload(
+            benchmark_options={"base_url": "http://frontend.svc:8000", "host": None, "port": None}
+        ).build_command()
+        assert cmd[cmd.index("--base-url") + 1] == "http://frontend.svc:8000"
+        assert "--host" not in cmd
+        assert "--port" not in cmd
+
+    def test_benchmark_options_property_reports_effective_options(self):
+        w = InferencexWorkload(benchmark_options={"num_prompts": 64})
+        assert w.benchmark_options["num_prompts"] == 64
+        assert w.benchmark_options["model"] == "Qwen/Qwen3-8B"
+        # A copy, so mutating it cannot change what the workload will run.
+        w.benchmark_options["num_prompts"] = 1
+        assert w.benchmark_options["num_prompts"] == 64
+
+    def test_defaults_constant_is_not_mutated_by_construction(self):
+        before = dict(DEFAULT_BENCHMARK_OPTIONS)
+        InferencexWorkload(benchmark_options={"model": "other/model", "num_prompts": 8})
+        assert dict(DEFAULT_BENCHMARK_OPTIONS) == before
+
+    def test_container_name_none_omits_name_flag(self):
+        cmd = InferencexWorkload(container_name=None).build_command()
+        assert "--name" not in cmd
+        assert cmd[:6] == ["docker", "run", "--rm", "-t", "--network", "host"]
+
+    def test_env_and_docker_extra_args_precede_the_image(self):
+        cmd = InferencexWorkload(
+            env={"HF_TOKEN": "secret"},
+            docker_extra_args=("-v", "/tmp/out:/out"),
+        ).build_command()
+        image_index = cmd.index("openmosaic/inferencex:latest")
+        assert cmd[image_index - 4 : image_index] == [
+            "-e",
+            "HF_TOKEN=secret",
+            "-v",
+            "/tmp/out:/out",
+        ]
+
+    def test_extra_args_come_last_so_they_can_override(self):
+        cmd = InferencexWorkload(
+            benchmark_options={"num_prompts": 64},
+            benchmark_extra_args=("--num-prompts", "128"),
+        ).build_command()
+        assert cmd[-2:] == ["--num-prompts", "128"]
+
+
+class TestBenchmarkOptionArgv:
+    """Tests for the generic option -> flag conversion."""
+
+    def test_scalars_become_kebab_case_flags(self):
+        assert benchmark_option_argv({"num_prompts": 64, "random_input_len": 512}) == [
+            "--num-prompts",
+            "64",
+            "--random-input-len",
+            "512",
+        ]
+
+    def test_true_emits_a_bare_flag(self):
+        assert benchmark_option_argv({"ignore_eos": True}) == ["--ignore-eos"]
+
+    def test_none_and_false_emit_nothing(self):
+        assert benchmark_option_argv({"seed": None, "disable_tqdm": False}) == []
+
+    def test_sequence_emits_repeated_values(self):
+        assert benchmark_option_argv({"goodput": ["ttft:200", "tpot:50"]}) == [
+            "--goodput",
+            "ttft:200",
+            "tpot:50",
+        ]
+
+    def test_mapping_emits_key_value_pairs(self):
+        assert benchmark_option_argv({"metadata": {"tp": 8, "sku": "rtx6000pro"}}) == [
+            "--metadata",
+            "tp=8",
+            "sku=rtx6000pro",
+        ]
+
+    def test_string_value_is_not_treated_as_a_sequence(self):
+        assert benchmark_option_argv({"endpoint": "/v1/chat/completions"}) == [
+            "--endpoint",
+            "/v1/chat/completions",
+        ]
+
+    def test_zero_is_emitted_rather_than_skipped(self):
+        # 0 is falsy but meaningful (--seed 0, --random-prefix-len 0); only None/False are skipped.
+        assert benchmark_option_argv({"seed": 0}) == ["--seed", "0"]
+
+    def test_explicit_flag_key_passes_through(self):
+        # An escape hatch for any flag whose name does not round-trip through snake_case.
+        assert benchmark_option_argv({"--some-new-flag": "v"}) == ["--some-new-flag", "v"]
+
+    def test_unknown_flag_is_passed_through_untouched(self):
+        # The whole point: an option added upstream needs no change here.
+        assert benchmark_option_argv({"invented_upstream_flag": 3}) == [
+            "--invented-upstream-flag",
+            "3",
+        ]
+
+
+class TestBenchmarkServingOutputParsing:
+    """Tests for parsing the benchmark_serving.py summary block."""
+
+    def test_parses_summary_fields(self):
+        r = parse_benchmark_serving_output(BENCHMARK_SERVING_OUTPUT)
+        assert r.successful_requests == 64
+        assert r.duration_seconds == 42.17
+        assert r.total_input_tokens == 32768
+        assert r.total_generated_tokens == 4096
+        assert r.request_throughput == 1.52
+        assert r.output_token_throughput == 97.13
+        assert r.total_token_throughput == 874.21
+        assert r.raw_output == BENCHMARK_SERVING_OUTPUT
+        assert r.passed is True
+
+    def test_parses_percentile_latencies(self):
+        latency = parse_benchmark_serving_output(BENCHMARK_SERVING_OUTPUT).latency_ms
+        assert latency["mean_ttft"] == 128.44
+        assert latency["median_ttft"] == 119.02
+        assert latency["p99_ttft"] == 288.31
+        # A fractional percentile keeps its precision in the key rather than colliding with p99.
+        assert latency["p99_9_ttft"] == 301.77
+        assert latency["mean_tpot"] == 18.22
+        assert latency["p90_tpot"] == 22.41
+
+    def test_metrics_dict_exposes_raw_normalised_keys(self):
+        m = parse_benchmark_serving_output(BENCHMARK_SERVING_OUTPUT).metrics
+        assert m["successful_requests"] == 64
+        assert m["benchmark_duration_s"] == 42.17
+        assert m["total_token_throughput_tok_s"] == 874.21
+        assert m["p99_9_ttft_ms"] == 301.77
+
+    def test_unknown_summary_row_is_captured_generically(self):
+        # The whole point: a row added upstream lands in .metrics with no change to the parser.
+        output = BENCHMARK_SERVING_OUTPUT.replace(
+            "Total input tokens:",
+            "Invented Upstream Metric (widgets):      12.5\nTotal input tokens:",
+        )
+        r = parse_benchmark_serving_output(output)
+        assert r.metrics["invented_upstream_metric_widgets"] == 12.5
+        # ...and does not disturb the rows we do name.
+        assert r.total_input_tokens == 32768
+
+    def test_goodput_absent_when_not_requested(self):
+        assert parse_benchmark_serving_output(BENCHMARK_SERVING_OUTPUT).request_goodput is None
+
+    def test_ignores_numeric_lines_above_the_banner(self):
+        # "Maximum request concurrency: 8" is printed before the summary and must not be read
+        # as a summary field, nor stop the real fields from parsing.
+        r = parse_benchmark_serving_output(BENCHMARK_SERVING_OUTPUT)
+        assert r.successful_requests == 64
+        assert "maximum_request_concurrency" not in r.metrics
+
+    def test_missing_banner_yields_empty_result(self):
+        r = parse_benchmark_serving_output("Traceback (most recent call last):\n  boom\n")
+        assert r.metrics == {}
+        assert r.successful_requests is None
+        assert r.duration_seconds is None
+        assert r.latency_ms == {}
+        assert r.passed is False
+
+    def test_truncated_block_parses_what_is_present(self):
+        truncated = BENCHMARK_SERVING_OUTPUT.split("Total input tokens")[0]
+        r = parse_benchmark_serving_output(truncated)
+        assert r.successful_requests == 64
+        assert r.duration_seconds == 42.17
+        assert r.total_input_tokens is None
+
+    def test_empty_output_does_not_raise(self):
+        assert parse_benchmark_serving_output("") == InferencexBenchmarkResult(raw_output="")
+
+    def test_zero_completed_requests_is_not_passed(self):
+        output = BENCHMARK_SERVING_OUTPUT.replace(
+            "Successful requests:                     64",
+            "Successful requests:                     0 ",
+        )
+        r = parse_benchmark_serving_output(output)
+        assert r.successful_requests == 0
+        assert r.passed is False
 
 
 class TestNcclOutputParsing:
