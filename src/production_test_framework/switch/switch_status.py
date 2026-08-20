@@ -24,14 +24,16 @@ from typing import IO, TextIO
 
 from docopt import docopt
 
+from production_test_framework.switch.arista.arista_eos_switch import AristaEosSwitch
 from production_test_framework.switch.models import NetworkSwitchConfig, NetworkSwitchStatus, Port, Vlan
 from production_test_framework.switch.network_switch import NetworkSwitch
 from production_test_framework.switch.nvidia.nvidia_cumulus_switch import NvidiaCumulusSwitch
 from production_test_framework.switch.port_sort import sort_ports
 
-DEFAULT_SWITCH_TYPE = "nvidia-cumulus"
+NVIDIA_SWITCH_TYPE = "nvidia-cumulus"
+ARISTA_SWITCH_TYPE = "arista-eos"
 
-_SWITCH_TYPES = frozenset({DEFAULT_SWITCH_TYPE})
+_SWITCH_TYPES = frozenset({NVIDIA_SWITCH_TYPE, ARISTA_SWITCH_TYPE})
 
 logger = logging.getLogger(__name__)
 
@@ -297,7 +299,7 @@ def create_switch(
         print(f"error: unknown switch-type {switch_type!r} (supported: {supported})", file=sys.stderr)
         sys.exit(2)
 
-    if switch_type == DEFAULT_SWITCH_TYPE:
+    if switch_type == NVIDIA_SWITCH_TYPE:
         config = NetworkSwitchConfig(
             host=hostname,
             username=username,
@@ -306,6 +308,16 @@ def create_switch(
             port=8765,
         )
         return NvidiaCumulusSwitch(config)
+
+    if switch_type == ARISTA_SWITCH_TYPE:
+        config = NetworkSwitchConfig(
+            host=hostname,
+            username=username,
+            password=password,
+            verify_tls=False,
+            port=80,
+        )
+        return AristaEosSwitch(config)
 
     raise AssertionError(f"unhandled switch-type: {switch_type}")
 
@@ -319,7 +331,7 @@ def main(argv: list[str] | None = None) -> int:
     if log_level:
         _configure_logging(log_level)
 
-    switch_type = args["--switch-type"] or DEFAULT_SWITCH_TYPE
+    switch_type = args["--switch-type"] or NVIDIA_SWITCH_TYPE
     if log_level:
         logger.debug(f"switch-type={switch_type} hostname={args['--hostname']}")
 

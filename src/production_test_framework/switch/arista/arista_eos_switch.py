@@ -36,22 +36,31 @@ class AristaEosSwitch(NetworkSwitch):
         super().__init__(config)
         self._logger = logging.getLogger(__name__)
         self._logger.debug(f"Initializing AristaEosSwitch with config: {config}")
-        # pyeapi's https transport uses an unverified SSL context when none is
-        # passed, so build an explicit context to honour config.verify_tls.
-        if config.verify_tls:
-            context = ssl.create_default_context()
+        # Port 80 is cleartext eAPI; anything else is TLS.
+        if config.port == 80:
+            connection = pyeapi.connect(
+                transport="http",
+                host=config.host,
+                username=config.username,
+                password=config.password,
+                port=config.port,
+            )
         else:
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-        connection = pyeapi.connect(
-            transport="https",
-            host=config.host,
-            username=config.username,
-            password=config.password,
-            port=config.port,
-            context=context,
-        )
+            # Explicit context so config.verify_tls is honoured (pyeapi defaults to unverified).
+            if config.verify_tls:
+                context = ssl.create_default_context()
+            else:
+                context = ssl.create_default_context()
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+            connection = pyeapi.connect(
+                transport="https",
+                host=config.host,
+                username=config.username,
+                password=config.password,
+                port=config.port,
+                context=context,
+            )
         self._node = pyeapi.client.Node(connection)
 
     @property
