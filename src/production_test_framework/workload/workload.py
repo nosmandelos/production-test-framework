@@ -3,10 +3,11 @@
 
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable
+from typing import Any
 
 from production_test_framework.utils.polling import wait_for
 
@@ -17,12 +18,14 @@ class WorkloadStatus(Enum):
     COMPLETED = "completed"
     ERROR = "error"
 
+
 @dataclass
 class WorkloadResult:
     start_time: float
     end_time: float
     result: Any
     status: WorkloadStatus
+
     @property
     def runtime(self) -> float:
         return self.end_time - self.start_time

@@ -16,6 +16,7 @@ from typing import Any
 
 from production_test_framework.ssh import CommandResult
 from production_test_framework.workload.command_workload import CommandWorkload, WorkloadCancelled
+from production_test_framework.workload.docker_mixin import DockerContainerMixin
 
 __all__ = [
     "DEFAULT_BENCHMARK_OPTIONS",
@@ -218,7 +219,7 @@ def benchmark_option_argv(options: Mapping[str, Any]) -> list[str]:
     return args
 
 
-class InferencexWorkload(CommandWorkload):
+class InferencexWorkload(DockerContainerMixin, CommandWorkload):
     """
     Run the InferenceX / vLLM ``benchmark_serving.py`` workload inside a container on the
     same host (requires ``docker`` on PATH; often used with a mounted Docker socket).
@@ -228,12 +229,13 @@ class InferencexWorkload(CommandWorkload):
     """
 
     workload_name = "Inferencex"
+    container_name_prefix = "inferencex"
 
     def __init__(
         self,
         *,
         image_name: str = "openmosaic/inferencex:latest",
-        container_name: str | None = "inferencex",
+        container_name: str | None = None,
         benchmark_script: str = "/workspace/InferenceX/utils/bench_serving/benchmark_serving.py",
         python_executable: str = "python3",
         benchmark_options: Mapping[str, Any] | None = None,
@@ -242,17 +244,19 @@ class InferencexWorkload(CommandWorkload):
         env: Mapping[str, str] | None = None,
         docker_extra_args: tuple[str, ...] = (),
     ):
-        super().__init__(timeout=docker_exec_timeout)
+        super().__init__(
+            image_name=image_name,
+            container_name=container_name,
+            env=env,
+            docker_extra_args=docker_extra_args,
+            timeout=docker_exec_timeout,
+        )
 
-        self._image_name = image_name
-        self._container_name = container_name
         self._benchmark_script = benchmark_script
         self._python_executable = python_executable
         self._benchmark_options = {**DEFAULT_BENCHMARK_OPTIONS, **(benchmark_options or {})}
         self._benchmark_extra_args = benchmark_extra_args
         self._docker_exec_timeout = docker_exec_timeout
-        self._env = dict(env or {})
-        self._docker_extra_args = docker_extra_args
 
     @property
     def benchmark_options(self) -> dict[str, Any]:
@@ -268,26 +272,10 @@ class InferencexWorkload(CommandWorkload):
             *self._benchmark_extra_args,
         ]
 
-    def _env_args(self) -> list[str]:
-        args: list[str] = []
-        for key, value in self._env.items():
-            args.extend(["-e", f"{key}={value}"])
-        return args
-
-    def _docker_exec_cmd(self) -> list[str]:
-        cmd = ["docker", "run", "--rm", "-t", "--network", "host"]
-        # A fixed --name collides with a concurrent or leftover container; container_name=None
-        # lets Docker assign one instead.
-        if self._container_name:
-            cmd.extend(["--name", self._container_name])
-        cmd.extend(self._env_args())
-        cmd.extend(self._docker_extra_args)
-        cmd.append(self._image_name)
-        cmd.extend(self._benchmark_inner_argv())
-        return cmd
-
     def build_command(self) -> list[str]:
-        return self._docker_exec_cmd()
+        # --network host is what lets a host/port endpoint reach a server published on the
+        # host; everything else about the docker invocation is the base class's.
+        return [*self.docker_run_argv("--network", "host"), *self._benchmark_inner_argv()]
 
     def parse_output(self, result: CommandResult) -> InferencexBenchmarkResult:
         return parse_benchmark_serving_output(result.stdout)

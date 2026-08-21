@@ -3,14 +3,26 @@
 
 """Unit tests for workload base and concrete workload classes."""
 
+import subprocess
 import threading
 import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from production_test_framework.docker import (
+    CONTAINER_LABEL,
+    docker_argv,
+    force_remove_container,
+    label_args,
+    list_containers_by_label,
+    remove_containers_by_label,
+    unique_container_name,
+)
 from production_test_framework.ssh import CommandResult
 from production_test_framework.vllm import InferenceResult
+from production_test_framework.workload.command_workload import CommandWorkload
+from production_test_framework.workload.docker_mixin import DockerContainerMixin
 from production_test_framework.workload.inferencex_workload import (
     DEFAULT_BENCHMARK_OPTIONS,
     InferencexBenchmarkResult,
@@ -25,6 +37,33 @@ from production_test_framework.workload.nccl_workload import (
 )
 from production_test_framework.workload.prompt_workload import BACKEND_TYPE, PromptWorkload
 from production_test_framework.workload.workload import Workload, WorkloadStatus
+
+
+@pytest.fixture
+def mock_inferencex_run():
+    """
+    Stand in for the docker run subprocess, returning a successful benchmark result.
+    """
+    with patch(
+        "production_test_framework.workload.command_workload.run_cancellable_command",
+    ) as m:
+        m.return_value = CommandResult(returncode=0, stdout="benchmark output\n", stderr="")
+        yield m
+
+
+@pytest.fixture(autouse=True)
+def no_real_docker_cleanup():
+    """Stop container cleanup from invoking the real docker CLI.
+
+    _cleanup_after_run runs after every command and again on stop, so without this the unit
+    tests would shell out to docker and depend on whether a daemon happens to be running.
+
+    One patch target covers every containerised workload now that cleanup lives on
+    DockerContainerMixin rather than being repeated per workload.
+    """
+    with patch("production_test_framework.workload.docker_mixin.force_remove_container") as remove:
+        yield remove
+
 
 NCCL_ALL_REDUCE_OUTPUT = """\
 # nThread 1 nGpus 8 minBytes 8 maxBytes 268435456 step: 2(factor) warmup iters: 5 iters: 20 validation: 1
@@ -315,42 +354,51 @@ class TestInferencexWorkload:
         w.shutdown_executor(wait=True)
 
 
-# Exactly what InferencexWorkload(docker_exec_timeout=...) emitted before the option surface was
-# added. Frozen on purpose: mosaic's only call site passes nothing else, so any drift here is a
-# breaking change to a consumer rather than a test that needs updating.
-LEGACY_INFERENCEX_COMMAND = [
-    "docker",
-    "run",
-    "--rm",
-    "-t",
-    "--network",
-    "host",
-    "--name",
-    "inferencex",
-    "openmosaic/inferencex:latest",
-    "python3",
-    "/workspace/InferenceX/utils/bench_serving/benchmark_serving.py",
-    "--host",
-    "localhost",
-    "--port",
-    "8080",
-    "--model",
-    "Qwen/Qwen3-8B",
-    "--backend",
-    "vllm",
-    "--dataset-name",
-    "random",
-]
+def expected_inferencex_command(name: str) -> list[str]:
+    """The full argv a default InferencexWorkload emits, for the container called *name*.
+
+    Frozen on purpose: consumers construct this workload with nothing but a timeout, so drift
+    here changes what they run. The container name and its label are the only parts that vary
+    between instances -- they are generated per run so a container left behind by an earlier
+    run cannot block the next one, and so cleanup has something to remove.
+    """
+    return [
+        "docker",
+        "run",
+        "--rm",
+        "-t",
+        "--network",
+        "host",
+        "--name",
+        name,
+        "--label",
+        f"{CONTAINER_LABEL}={name}",
+        "openmosaic/inferencex:latest",
+        "python3",
+        "/workspace/InferenceX/utils/bench_serving/benchmark_serving.py",
+        "--host",
+        "localhost",
+        "--port",
+        "8080",
+        "--model",
+        "Qwen/Qwen3-8B",
+        "--backend",
+        "vllm",
+        "--dataset-name",
+        "random",
+    ]
 
 
 class TestInferencexCommand:
     """Tests for the InferenceX argv construction."""
 
-    def test_default_command_matches_legacy_argv(self):
-        assert InferencexWorkload(docker_exec_timeout=1200).build_command() == LEGACY_INFERENCEX_COMMAND
+    def test_default_command_matches_expected_argv(self):
+        workload = InferencexWorkload(docker_exec_timeout=1200)
+        assert workload.build_command() == expected_inferencex_command(workload.container_name)
 
     def test_empty_options_emit_no_extra_flags(self):
-        assert InferencexWorkload(benchmark_options={}).build_command() == LEGACY_INFERENCEX_COMMAND
+        workload = InferencexWorkload(benchmark_options={})
+        assert workload.build_command() == expected_inferencex_command(workload.container_name)
 
     def test_options_layer_over_the_defaults(self):
         cmd = InferencexWorkload(benchmark_options={"model": "other/model"}).build_command()
@@ -381,10 +429,25 @@ class TestInferencexCommand:
         InferencexWorkload(benchmark_options={"model": "other/model", "num_prompts": 8})
         assert dict(DEFAULT_BENCHMARK_OPTIONS) == before
 
-    def test_container_name_none_omits_name_flag(self):
-        cmd = InferencexWorkload(container_name=None).build_command()
-        assert "--name" not in cmd
-        assert cmd[:6] == ["docker", "run", "--rm", "-t", "--network", "host"]
+    def test_container_name_defaults_to_a_unique_name(self):
+        # Not a fixed name: a container an earlier run left behind would make this one fail
+        # with "name already in use". Not anonymous either, or nothing could remove it.
+        first, second = InferencexWorkload(), InferencexWorkload()
+        assert first.container_name != second.container_name
+        assert first.container_name.startswith("inferencex-")
+        assert first.build_command()[first.build_command().index("--name") + 1] == first.container_name
+
+    def test_explicit_container_name_is_used_verbatim(self):
+        workload = InferencexWorkload(container_name="mine")
+        assert workload.container_name == "mine"
+        assert workload.build_command()[workload.build_command().index("--name") + 1] == "mine"
+
+    def test_container_is_labelled_for_orphan_sweeps(self):
+        # Lets a caller find containers this framework started without knowing their names:
+        # docker ps -aq --filter label=production-test-framework.workload
+        workload = InferencexWorkload()
+        cmd = workload.build_command()
+        assert cmd[cmd.index("--label") + 1] == f"{CONTAINER_LABEL}={workload.container_name}"
 
     def test_env_and_docker_extra_args_precede_the_image(self):
         cmd = InferencexWorkload(
@@ -917,3 +980,260 @@ class TestPromptWorkload:
         block.set()
         wl._completion_fut.result(timeout=10.0)
         wl.shutdown_executor(wait=True)
+
+
+class TestContainerCleanup:
+    """
+    Tests that a containerised run cannot leave its container behind.
+
+    ``docker run --rm`` removes a container when the container exits, which covers a run that
+    finishes on its own. It does not cover a stopped or timed-out run: cancellation terminates
+    the ``docker run`` client, and because these workloads allocate a TTY the client does not
+    proxy that signal to the container. Without an explicit removal the container keeps running,
+    ``--rm`` never fires, and for the NCCL workload the GPUs it reserved stay reserved.
+    """
+
+    def test_container_removed_after_a_successful_run(self, mock_inferencex_run, no_real_docker_cleanup):
+        inferencex_rm = no_real_docker_cleanup
+        w = InferencexWorkload()
+        w.start()
+        w._completion_fut.result(timeout=10.0)
+
+        inferencex_rm.assert_any_call(w.container_name)
+        w.shutdown_executor(wait=True)
+
+    def test_container_removed_after_a_stop(self, mock_inferencex_run, no_real_docker_cleanup):
+        inferencex_rm = no_real_docker_cleanup
+        w = InferencexWorkload()
+        w.start()
+        w.stop()
+
+        inferencex_rm.assert_any_call(w.container_name)
+        w.shutdown_executor(wait=True)
+
+    def test_container_removed_after_a_failed_run(self, mock_inferencex_run, no_real_docker_cleanup):
+        # The container must go even when the command itself failed; otherwise a run that
+        # errors early leaves the container behind for every later run to trip over.
+        inferencex_rm = no_real_docker_cleanup
+        mock_inferencex_run.return_value = CommandResult(returncode=1, stdout="", stderr="boom")
+        w = InferencexWorkload()
+        w.start()
+        with pytest.raises(RuntimeError, match="boom"):
+            w._completion_fut.result(timeout=10.0)
+
+        inferencex_rm.assert_any_call(w.container_name)
+        w.shutdown_executor(wait=True)
+
+    def test_nccl_container_removed_after_a_run(self, no_real_docker_cleanup):
+        nccl_rm = no_real_docker_cleanup
+        with patch("production_test_framework.workload.command_workload.run_cancellable_command") as m:
+            m.return_value = CommandResult(returncode=0, stdout=NCCL_ALL_REDUCE_OUTPUT, stderr="")
+            w = NcclWorkload(gpus_per_host=2)
+            w.start()
+            w._completion_fut.result(timeout=10.0)
+
+        nccl_rm.assert_any_call(w.container_name)
+        w.shutdown_executor(wait=True)
+
+    def test_no_container_removal_when_not_using_docker(self, no_real_docker_cleanup):
+        # Binaries run directly on the host have no container to remove.
+        nccl_rm = no_real_docker_cleanup
+        with patch("production_test_framework.workload.command_workload.run_cancellable_command") as m:
+            m.return_value = CommandResult(returncode=0, stdout=NCCL_ALL_REDUCE_OUTPUT, stderr="")
+            w = NcclWorkload(use_docker=False, image_name=None, gpus_per_host=2)
+            w.start()
+            w._completion_fut.result(timeout=10.0)
+
+        nccl_rm.assert_not_called()
+        w.shutdown_executor(wait=True)
+
+    def test_cleanup_failure_does_not_mask_the_result(self, mock_inferencex_run, no_real_docker_cleanup):
+        # A cleanup problem must not turn a good run into an error, nor replace the real reason
+        # a bad one failed.
+        inferencex_rm = no_real_docker_cleanup
+        inferencex_rm.side_effect = RuntimeError("docker unreachable")
+        w = InferencexWorkload()
+        w.start()
+        w._completion_fut.result(timeout=10.0)
+
+        assert w.status == WorkloadStatus.COMPLETED
+        assert w.get_result().result.raw_output == "benchmark output\n"
+        w.shutdown_executor(wait=True)
+
+
+class TestForceRemoveContainer:
+    """Tests for the docker removal helper itself."""
+
+    def test_success_reports_removed(self):
+        with patch("production_test_framework.docker.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, stdout="c\n", stderr="")
+            assert force_remove_container("c") is True
+        assert run.call_args[0][0] == ["docker", "rm", "--force", "c"]
+
+    def test_absent_container_is_success(self):
+        # The expected case after a clean run, where --rm already removed it.
+        with patch("production_test_framework.docker.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                [], 1, stdout="", stderr="Error response from daemon: No such container: c"
+            )
+            assert force_remove_container("c") is True
+
+    def test_other_failure_reports_false(self):
+        with patch("production_test_framework.docker.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess([], 1, stdout="", stderr="permission denied")
+            assert force_remove_container("c") is False
+
+    def test_missing_docker_binary_reports_false(self):
+        # Never raises: cleanup runs while a result is being settled.
+        with patch("production_test_framework.docker.subprocess.run", side_effect=OSError):
+            assert force_remove_container("c") is False
+
+    def test_names_are_unique_per_call(self):
+        assert unique_container_name("x") != unique_container_name("x")
+        assert unique_container_name("x").startswith("x-")
+
+    def test_argv_can_run_through_sudo(self):
+        # Some hosts only allow docker via sudo; the caller decides, rather than this module
+        # reading an environment variable of its own.
+        assert docker_argv("ps", sudo=True) == ["sudo", "docker", "ps"]
+        assert docker_argv("ps") == ["docker", "ps"]
+
+    def test_extra_labels_are_added_alongside_the_framework_one(self):
+        args = label_args("c", {"suite": "profiler_otel"})
+        assert args[:2] == ["--label", f"{CONTAINER_LABEL}=c"]
+        assert args[2:] == ["--label", "suite=profiler_otel"]
+
+
+class TestContainerLabelSweep:
+    """
+    Tests for finding and removing containers by label.
+
+    The sweep exists because a container that is still running cannot be cleaned up by
+    `docker container prune`, and an orphan's generated name is not usually to hand.
+    """
+
+    def test_lists_ids_carrying_the_label(self):
+        with patch("production_test_framework.docker.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, stdout="abc123\ndef456\n", stderr="")
+            assert list_containers_by_label() == ["abc123", "def456"]
+        assert run.call_args[0][0] == [
+            "docker",
+            "ps",
+            "--quiet",
+            "--all",
+            "--filter",
+            f"label={CONTAINER_LABEL}",
+        ]
+
+    def test_no_containers_is_not_an_error(self):
+        with patch("production_test_framework.docker.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, stdout="\n", stderr="")
+            assert list_containers_by_label() == []
+
+    def test_unreachable_docker_is_not_an_error(self):
+        # Callers are cleaning up; an unreachable daemon must not fail the session.
+        with patch("production_test_framework.docker.subprocess.run", side_effect=OSError):
+            assert list_containers_by_label() == []
+            assert remove_containers_by_label() == []
+
+    def test_removes_every_listed_id_in_one_call(self):
+        with patch("production_test_framework.docker.subprocess.run") as run:
+            run.side_effect = [
+                subprocess.CompletedProcess([], 0, stdout="abc\ndef\n", stderr=""),
+                subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+            ]
+            assert remove_containers_by_label() == ["abc", "def"]
+        assert run.call_args[0][0] == ["docker", "rm", "--force", "abc", "def"]
+
+    def test_nothing_to_remove_makes_no_removal_call(self):
+        with patch("production_test_framework.docker.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            assert remove_containers_by_label() == []
+        assert run.call_count == 1, "should not have issued a docker rm with no ids"
+
+    def test_a_custom_label_can_be_swept(self):
+        with patch("production_test_framework.docker.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            list_containers_by_label("my.label")
+        assert "label=my.label" in run.call_args[0][0]
+
+
+class TestDockerContainerMixin:
+    """
+    Tests for the behaviour every containerised workload inherits.
+
+    The point of the base class is that a new containerised workload cannot forget to clean up
+    after itself. Forgetting is silent, and a leaked container holding --gpus keeps those GPUs
+    from every later run on the host, so these assert on what a subclass gets for free.
+    """
+
+    class _Minimal(DockerContainerMixin, CommandWorkload):
+        """The least a subclass can define."""
+
+        workload_name = "Minimal"
+        container_name_prefix = "minimal"
+
+        def build_command(self) -> list[str]:
+            return [*self.docker_run_argv("--network", "host"), "echo", "hi"]
+
+    def test_subclass_gets_a_unique_name_without_asking(self):
+        first, second = self._Minimal(image_name="img"), self._Minimal(image_name="img")
+        assert first.container_name.startswith("minimal-")
+        assert first.container_name != second.container_name
+
+    def test_subclass_gets_name_and_label_in_its_argv(self):
+        w = self._Minimal(image_name="img")
+        cmd = w.build_command()
+        assert cmd[cmd.index("--name") + 1] == w.container_name
+        assert cmd[cmd.index("--label") + 1] == f"{CONTAINER_LABEL}={w.container_name}"
+
+    def test_subclass_gets_cleanup_without_defining_it(self, no_real_docker_cleanup):
+        # The whole reason this lives on the base rather than in each workload.
+        assert "_cleanup_after_run" not in vars(self._Minimal), (
+            "the fixture subclass must not define cleanup, or this proves nothing"
+        )
+        w = self._Minimal(image_name="img")
+        with patch("production_test_framework.workload.command_workload.run_cancellable_command") as run:
+            run.return_value = CommandResult(returncode=0, stdout="hi", stderr="")
+            w.start()
+            w._completion_fut.result(timeout=10.0)
+
+        no_real_docker_cleanup.assert_any_call(w.container_name)
+        w.shutdown_executor(wait=True)
+
+    def test_flags_precede_the_name_and_image_comes_last(self):
+        w = self._Minimal(image_name="img", docker_extra_args=("-v", "/a:/b"))
+        cmd = w.docker_run_argv("--gpus", "all")
+        assert cmd[:6] == ["docker", "run", "--rm", "-t", "--gpus", "all"]
+        assert cmd[-3:] == ["-v", "/a:/b", "img"], "extra args must be last so they can override"
+
+    def test_env_becomes_dash_e_arguments(self):
+        w = self._Minimal(image_name="img", env={"A": "1"})
+        assert w.env_args() == ["-e", "A=1"]
+        # mpirun forwards the same variables with a different flag.
+        assert w.env_args("-x") == ["-x", "A=1"]
+
+    def test_uses_docker_defaults_true(self):
+        assert self._Minimal(image_name="img").uses_docker is True
+
+    @pytest.mark.parametrize("workload", [InferencexWorkload, NcclWorkload])
+    def test_mixin_precedes_the_workload_base(self, workload):
+        # Order matters and is easy to get wrong: written the other way round,
+        # CommandWorkload's no-op _cleanup_after_run would win and containers would leak
+        # again, silently and with every test still passing.
+        mro = workload.__mro__
+        assert mro.index(DockerContainerMixin) < mro.index(CommandWorkload), (
+            f"{workload.__name__} must list DockerContainerMixin first"
+        )
+        assert workload._cleanup_after_run is DockerContainerMixin._cleanup_after_run
+
+    def test_cooperative_init_passes_the_rest_down_the_mro(self):
+        # The mixin consumes only its own arguments; everything else has to reach the
+        # workload base, or a timeout set by the caller would be quietly dropped.
+        w = self._Minimal(image_name="img", timeout=1234)
+        assert w._timeout == 1234
+
+    def test_mixin_does_not_require_a_workload_base_of_its_own(self):
+        # It adds a capability rather than being a kind of workload, so it carries no
+        # inheritance of its own and can be mixed into anything.
+        assert DockerContainerMixin.__mro__[1:] == (object,)

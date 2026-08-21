@@ -20,6 +20,7 @@ from enum import Enum
 
 from production_test_framework.ssh import CommandResult
 from production_test_framework.workload.command_workload import CommandWorkload, WorkloadCancelled
+from production_test_framework.workload.docker_mixin import DockerContainerMixin
 
 __all__ = [
     "DEFAULT_OTEL_ENDPOINT",
@@ -160,7 +161,7 @@ def parse_nccl_output(output: str, test: str = "") -> NcclTestResult:
     return result
 
 
-class NcclWorkload(CommandWorkload):
+class NcclWorkload(DockerContainerMixin, CommandWorkload):
     """
     Run an nccl-tests performance binary and report the bandwidth it measured.
 
@@ -182,13 +183,14 @@ class NcclWorkload(CommandWorkload):
     """
 
     workload_name = "NCCL"
+    container_name_prefix = "nccl-tests"
 
     def __init__(
         self,
         *,
         test: NcclTest = NcclTest.ALL_REDUCE,
         image_name: str | None = "openmosaic/mosaic-nccl-tests:latest",
-        container_name: str = "nccl-tests",
+        container_name: str | None = None,
         binary_dir: str = "/workspace/bin",
         gpus_per_host: int = 8,
         min_bytes: str = "8",
@@ -211,11 +213,22 @@ class NcclWorkload(CommandWorkload):
     ):
         if use_docker and not image_name:
             raise ValueError("use_docker=True requires image_name (there is no default nccl-tests image)")
-        super().__init__(timeout=timeout)
+
+        # Built before super() so the base owns the finished mapping: the profiler endpoint is
+        # part of the run's environment, not something layered on afterwards.
+        run_env = dict(env or {})
+        if otel_endpoint and OTEL_ENDPOINT_ENV not in run_env:
+            run_env[OTEL_ENDPOINT_ENV] = otel_endpoint
+
+        super().__init__(
+            image_name=image_name,
+            container_name=container_name,
+            env=run_env,
+            docker_extra_args=docker_extra_args,
+            timeout=timeout,
+        )
 
         self._test = test
-        self._image_name = image_name
-        self._container_name = container_name
         self._binary_dir = binary_dir.rstrip("/")
         self._gpus_per_host = gpus_per_host
         self._min_bytes = min_bytes
@@ -226,19 +239,20 @@ class NcclWorkload(CommandWorkload):
         self._check = check
         self._hosts = tuple(hosts)
         self._num_processes = num_processes
-        self._env = dict(env or {})
-        if otel_endpoint and OTEL_ENDPOINT_ENV not in self._env:
-            self._env[OTEL_ENDPOINT_ENV] = otel_endpoint
         self._use_docker = use_docker
         self._gpus = gpus
         self._docker_network = docker_network
-        self._docker_extra_args = docker_extra_args
         self._mpi_extra_args = mpi_extra_args
         self._test_extra_args = test_extra_args
 
     @property
     def test(self) -> NcclTest:
         return self._test
+
+    @property
+    def uses_docker(self) -> bool:
+        """False when the binaries are run directly on the host, so there is nothing to clean up."""
+        return self._use_docker
 
     @property
     def gpus(self) -> str:
@@ -287,18 +301,11 @@ class NcclWorkload(CommandWorkload):
             return 1
         return len(self._hosts) * self._gpus_per_host
 
-    def _env_args(self, flag: str) -> list[str]:
-        args: list[str] = []
-        for key, value in self._env.items():
-            args.extend([flag, f"{key}={value}"])
-        return args
-
     def _docker_argv(self) -> list[str]:
-        return [
-            "docker",
-            "run",
-            "--rm",
-            "-t",
+        # nccl-tests needs the memlock and stack limits raised for large message sizes, and
+        # host IPC for shared-memory transports between ranks. Naming, labelling, environment
+        # and the image are the base class's.
+        return self.docker_run_argv(
             "--gpus",
             self.gpus,
             "--network",
@@ -308,12 +315,7 @@ class NcclWorkload(CommandWorkload):
             "memlock=-1",
             "--ulimit",
             "stack=67108864",
-            "--name",
-            self._container_name,
-            *self._env_args("-e"),
-            *self._docker_extra_args,
-            self._image_name,
-        ]
+        )
 
     def _mpi_argv(self) -> list[str]:
         host_list = ",".join(f"{host}:{self._gpus_per_host}" for host in self._hosts)
@@ -324,7 +326,7 @@ class NcclWorkload(CommandWorkload):
             str(self.num_processes),
             "-H",
             host_list,
-            *self._env_args("-x"),
+            *self.env_args("-x"),
             *self._mpi_extra_args,
         ]
 
