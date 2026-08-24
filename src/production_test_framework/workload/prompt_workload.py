@@ -2,7 +2,6 @@
 # Copyright (c) 2025 Delos Data, Inc.
 
 import logging
-import threading
 import time
 from concurrent.futures import CancelledError, Future
 from enum import Enum
@@ -53,7 +52,7 @@ class PromptWorkload(Workload):
         self.logger.info("sending prompt to backend...")
         self._start_time = time.time()
         self.prompt_state = WorkloadStatus.RUNNING
-        self.prompt_result = None      
+        self.prompt_result = None
         self._completion_fut = self.submit_background(self.backend.complete, self.prompt)
         self._completion_fut.add_done_callback(self._on_completion_done)
 
@@ -67,8 +66,10 @@ class PromptWorkload(Workload):
         self.logger.info("Prompt workload stopped")
 
     def get_result(self) -> str:
-        """Return inference text after the prompt task has completed."""        
-        return WorkloadResult(start_time=self._start_time, end_time=self._end_time, result=self.prompt_result, status=self.status)
+        """Return inference text after the prompt task has completed."""
+        return WorkloadResult(
+            start_time=self._start_time, end_time=self._end_time, result=self.prompt_result, status=self.status
+        )
 
     def _on_completion_done(self, fut: Future) -> None:
         try:

@@ -59,6 +59,11 @@ class CommandWorkload(Workload):
         """Value used for ``result`` before a run and after a stop/cancel."""
         return ""
 
+    def _cleanup_after_run(self) -> None:
+        """
+        Release anything the command left behind. Override for runs with side effects.
+        """
+
     @property
     def command_result(self) -> CommandResult | None:
         """Raw result of the last command run, for debugging failed runs."""
@@ -91,11 +96,23 @@ class CommandWorkload(Workload):
             poll_interval=self._poll_interval,
         )
         self._command_result = result
+        self._safe_cleanup()
         if not result.success:
             if self._cancel_event.is_set():
                 raise WorkloadCancelled()
             raise RuntimeError(result.stderr or result.stdout or f"{self.workload_name.lower()} command failed")
         return self.parse_output(result)
+
+    def _safe_cleanup(self) -> None:
+        """Run :meth:`_cleanup_after_run`, logging rather than propagating any failure.
+
+        A cleanup error must not replace the real reason a run failed, nor turn a successful
+        run into an error.
+        """
+        try:
+            self._cleanup_after_run()
+        except Exception:
+            self.logger.exception("%s workload cleanup failed", self.workload_name)
 
     def _on_command_done(self, fut: Future) -> None:
         try:
@@ -128,6 +145,7 @@ class CommandWorkload(Workload):
             self._completion_fut.cancel()
         self._workload_status = WorkloadStatus.STOPPED
         self._completion_fut = None
+        self._safe_cleanup()
 
     def get_result(self) -> WorkloadResult:
         return WorkloadResult(
