@@ -38,6 +38,16 @@ class LldpNeighbor:
 
 
 @dataclass(frozen=True)
+class MacEntry:
+    """A MAC address-table (FDB) entry: a MAC reachable on a switch port in a VLAN."""
+
+    mac: str
+    port: str
+    vlan: int | None = None
+    static: bool = False  # True = statically configured, False = dynamically learned
+
+
+@dataclass(frozen=True)
 class SwitchProcess:
     name: str
     pid: int

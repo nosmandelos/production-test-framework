@@ -21,10 +21,18 @@ import time
 from typing import Any
 
 import pyeapi
-from pyeapi.eapilib import CommandError, ConnectionError as EapiConnectionError
+from pyeapi.eapilib import CommandError
+from pyeapi.eapilib import ConnectionError as EapiConnectionError
 
 from production_test_framework.switch.exceptions import SwitchAPIError
-from production_test_framework.switch.models import LldpNeighbor, NetworkSwitchConfig, NetworkSwitchStatus, Port, Vlan
+from production_test_framework.switch.models import (
+    LldpNeighbor,
+    MacEntry,
+    NetworkSwitchConfig,
+    NetworkSwitchStatus,
+    Port,
+    Vlan,
+)
 from production_test_framework.switch.network_switch import NetworkSwitch
 from production_test_framework.switch.port_sort import port_id_sort_key
 
@@ -85,6 +93,12 @@ class AristaEosSwitch(NetworkSwitch):
         """LLDP neighbors whose advertised port id is a MAC (eAPI: show lldp neighbors detail)."""
         payload = self._run_show("show lldp neighbors detail").get("lldpNeighbors", {})
         return self._parse_lldp_neighbors(payload)
+
+    @property
+    def mac_table(self) -> list[MacEntry]:
+        """MAC address-table entries (eAPI: show mac address-table)."""
+        entries = self._run_show("show mac address-table").get("unicastTable", {}).get("tableEntries", [])
+        return self._parse_mac_table(entries)
 
     def port(self, port_id: str) -> Port:
         statuses = self._run_show(f"show interfaces {port_id} status").get("interfaceStatuses", {})
@@ -169,11 +183,7 @@ class AristaEosSwitch(NetworkSwitch):
         )
 
     def _parse_ports(self, statuses: dict[str, Any]) -> list[Port]:
-        ports = [
-            self._parse_port(port_id, body)
-            for port_id, body in statuses.items()
-            if isinstance(body, dict)
-        ]
+        ports = [self._parse_port(port_id, body) for port_id, body in statuses.items() if isinstance(body, dict)]
         return sorted(ports, key=lambda port: port_id_sort_key(port.id))
 
     def _member_ports(self, member_ids: list[str], statuses: dict[str, Any]) -> tuple[Port, ...]:
@@ -213,6 +223,18 @@ class AristaEosSwitch(NetworkSwitch):
                     continue
                 neighbors.append(LldpNeighbor(interface=interface_id, switch_port=switch_port, chassis_mac=mac))
         return sorted(neighbors, key=lambda neighbor: neighbor.switch_port)
+
+    def _parse_mac_table(self, entries: list[dict[str, Any]]) -> list[MacEntry]:
+        table: list[MacEntry] = []
+        for entry in entries:
+            interface = entry.get("interface", "")
+            mac = self._normalize_mac(entry.get("macAddress", ""))
+            if not interface or not mac:
+                continue
+            table.append(
+                MacEntry(mac=mac, port=interface, vlan=entry.get("vlanId"), static=entry.get("entryType") == "static")
+            )
+        return table
 
     @staticmethod
     def _interface_name_to_port(interface_id: str) -> int:

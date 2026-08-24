@@ -13,7 +13,14 @@ from requests.auth import HTTPBasicAuth
 from urllib3.util.retry import Retry
 
 from production_test_framework.switch.exceptions import SwitchAPIError
-from production_test_framework.switch.models import LldpNeighbor, NetworkSwitchConfig, NetworkSwitchStatus, Port, Vlan
+from production_test_framework.switch.models import (
+    LldpNeighbor,
+    MacEntry,
+    NetworkSwitchConfig,
+    NetworkSwitchStatus,
+    Port,
+    Vlan,
+)
 from production_test_framework.switch.network_switch import NetworkSwitch
 from production_test_framework.switch.nvidia.nvue_paths import (
     BRIDGE_DOMAIN,
@@ -99,6 +106,12 @@ class NvidiaCumulusSwitch(NetworkSwitch):
         """LLDP neighbors advertising a MAC chassis id (OpenAPI getInterfaces, view=lldp-detail)."""
         interfaces = self._run_api_call(INTERFACES_PATH, params={"view": VIEW_LLDP_DETAIL})
         return self._parse_lldp_neighbors(interfaces)
+
+    @property
+    def mac_table(self) -> list[MacEntry]:
+        # TODO: implement via NVUE (nv show bridge domain <domain> mac-table). Stubbed for now -
+        # no Cumulus switch on the bench to validate the path/response shape against.
+        raise NotImplementedError("mac_table is not yet implemented for the Cumulus/NVUE driver")
 
     def port(self, port_id: str) -> Port:
         """Single interface (OpenAPI operationId: getInterface)."""

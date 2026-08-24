@@ -3,7 +3,14 @@
 
 from abc import ABC, abstractmethod
 
-from production_test_framework.switch.models import LldpNeighbor, NetworkSwitchConfig, NetworkSwitchStatus, Port, Vlan
+from production_test_framework.switch.models import (
+    LldpNeighbor,
+    MacEntry,
+    NetworkSwitchConfig,
+    NetworkSwitchStatus,
+    Port,
+    Vlan,
+)
 
 
 class NetworkSwitch(ABC):
@@ -32,6 +39,12 @@ class NetworkSwitch(ABC):
     @abstractmethod
     def lldp_neighbors(self) -> list[LldpNeighbor]:
         """Get the LLDP neighbors advertising a MAC chassis id, one per switch port."""
+        ...
+
+    @property
+    @abstractmethod
+    def mac_table(self) -> list[MacEntry]:
+        """Get the switch MAC address-table (FDB) entries."""
         ...
 
     @abstractmethod
