@@ -15,6 +15,7 @@ REVISION_PATH = "/revision"
 
 BRIDGE_DOMAIN_PATH = f"/bridge/domain/{BRIDGE_DOMAIN}"
 BRIDGE_DOMAIN_VLANS_PATH = f"{BRIDGE_DOMAIN_PATH}/vlan"
+BRIDGE_DOMAIN_MAC_TABLE_PATH = f"{BRIDGE_DOMAIN_PATH}/mac-table"
 
 
 def interface_path(interface_id: str) -> str:
