@@ -13,10 +13,18 @@ from requests.auth import HTTPBasicAuth
 from urllib3.util.retry import Retry
 
 from production_test_framework.switch.exceptions import SwitchAPIError
-from production_test_framework.switch.models import LldpNeighbor, NetworkSwitchConfig, NetworkSwitchStatus, Port, Vlan
+from production_test_framework.switch.models import (
+    LldpNeighbor,
+    MacEntry,
+    NetworkSwitchConfig,
+    NetworkSwitchStatus,
+    Port,
+    Vlan,
+)
 from production_test_framework.switch.network_switch import NetworkSwitch
 from production_test_framework.switch.nvidia.nvue_paths import (
     BRIDGE_DOMAIN,
+    BRIDGE_DOMAIN_MAC_TABLE_PATH,
     BRIDGE_DOMAIN_VLANS_PATH,
     FIRMWARE_PATH,
     INTERFACES_PATH,
@@ -99,6 +107,12 @@ class NvidiaCumulusSwitch(NetworkSwitch):
         """LLDP neighbors advertising a MAC chassis id (OpenAPI getInterfaces, view=lldp-detail)."""
         interfaces = self._run_api_call(INTERFACES_PATH, params={"view": VIEW_LLDP_DETAIL})
         return self._parse_lldp_neighbors(interfaces)
+
+    @property
+    def mac_table(self) -> list[MacEntry]:
+        """MAC/FDB table for the bridge domain (NVUE: bridge domain <d> mac-table)."""
+        entries = self._run_api_call(BRIDGE_DOMAIN_MAC_TABLE_PATH)
+        return self._parse_mac_table(entries)
 
     def port(self, port_id: str) -> Port:
         """Single interface (OpenAPI operationId: getInterface)."""
@@ -331,6 +345,25 @@ class NvidiaCumulusSwitch(NetworkSwitch):
     def _parse_ports(self, interfaces: dict[str, Any]) -> list[Port]:
         ports = [self._parse_port(interface_id, body) for interface_id, body in interfaces.items()]
         return sorted(ports, key=lambda port: port_id_sort_key(port.id))
+
+    def _parse_mac_table(self, entries: dict[str, Any]) -> list[MacEntry]:
+        table: list[MacEntry] = []
+        for entry in entries.values():
+            if not isinstance(entry, dict):
+                continue
+            mac = entry.get("mac", "")
+            interface = entry.get("interface", "")
+            if not mac or not interface:
+                continue
+            table.append(
+                MacEntry(
+                    mac=mac.lower(),
+                    port=interface,
+                    vlan=entry.get("vlan"),
+                    static=entry.get("entry-type") == "permanent",
+                )
+            )
+        return table
 
     def _parse_lldp_neighbors(self, interfaces: dict[str, Any]) -> list[LldpNeighbor]:
         neighbors: list[LldpNeighbor] = []
