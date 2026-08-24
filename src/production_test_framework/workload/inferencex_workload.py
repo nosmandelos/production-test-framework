@@ -37,9 +37,6 @@ BenchmarkCancelled = WorkloadCancelled
 # To target a disaggregated deployment behind one frontend, pass base_url and drop host/port::
 #
 #     benchmark_options={"base_url": "http://frontend:8000", "host": None, "port": None}
-#
-# Dropping them is optional -- benchmark_serving.py prefers base_url when both are given
-# (benchmark_serving.py:836-841) -- but it keeps the emitted command honest about the target.
 DEFAULT_BENCHMARK_OPTIONS: Mapping[str, Any] = {
     "host": "localhost",
     "port": 8080,
@@ -144,12 +141,6 @@ def _metric_key(label: str) -> str:
 def parse_benchmark_serving_output(output: str) -> InferencexBenchmarkResult:
     """
     Parse the summary block ``benchmark_serving.py`` prints when a run finishes.
-
-    Every ``Label: <number>`` row is captured under a normalised key rather than matched against
-    a list of labels we know about, so added rows and extra percentiles are picked up for free.
-    Only lines after the "Serving Benchmark Result" banner are considered, so progress output
-    above it cannot be mistaken for a summary field. A truncated or absent block yields a result
-    with no metrics rather than raising.
     """
     result = InferencexBenchmarkResult(raw_output=output)
 
@@ -196,10 +187,6 @@ def benchmark_option_argv(options: Mapping[str, Any]) -> list[str]:
 
     Note that ``0`` and ``""`` are emitted: only ``None`` and ``False`` are skipped, so
     ``{"seed": 0}`` still produces ``--seed 0``.
-
-    The cost of not enumerating flags is that a typo is not caught here. It fails fast and
-    legibly instead: argparse rejects it, the container exits non-zero, and ``CommandWorkload``
-    surfaces "unrecognized arguments" from stderr as the workload error.
     """
     args: list[str] = []
     for key, value in options.items():

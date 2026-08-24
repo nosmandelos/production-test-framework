@@ -23,26 +23,6 @@ class DockerContainerMixin:
 
             def build_command(self):
                 return [*self.docker_run_argv("--network", "host"), "echo", "hi"]
-
-    A mixin rather than a base class because containerisation is a capability a workload has,
-    not a category it belongs to -- ``NcclWorkload`` can run its binaries directly on the host,
-    which would make "is a docker workload" untrue of some of its instances.
-
-    What it provides:
-
-    * a container name unique per run but still known, via :func:`unique_container_name`
-    * the framework label, so an orphan can be swept up by label alone
-    * ``-e`` arguments built from ``env``
-    * removal of the container once the run ends
-
-    That last one is the reason this is shared rather than repeated. ``docker run --rm`` only
-    removes a container that exited on its own; a stopped or timed-out run leaves it behind,
-    still holding whatever it reserved. Inheriting the cleanup means a workload gets it by
-    default instead of having to remember -- and forgetting would be silent, with a leaked
-    ``--gpus`` container keeping those GPUs from every later run on the host.
-
-    ``__init__`` is cooperative: it takes the container arguments and passes everything else
-    along the MRO, so a workload mixing it in does not have to wire anything up by hand.
     """
 
     #: Leading part of a generated container name; give each workload its own so a stray
