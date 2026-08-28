@@ -3,6 +3,8 @@
 
 """Unit tests for workload base and concrete workload classes."""
 
+import json
+import shlex
 import subprocess
 import threading
 import time
@@ -20,15 +22,16 @@ from production_test_framework.docker import (
     unique_container_name,
 )
 from production_test_framework.ssh import CommandResult
-from production_test_framework.vllm import InferenceResult
+from production_test_framework.vllm import DEFAULT_MODEL, InferenceResult
 from production_test_framework.workload.command_workload import CommandWorkload
 from production_test_framework.workload.docker_mixin import DockerContainerMixin
 from production_test_framework.workload.inferencex_workload import (
     DEFAULT_BENCHMARK_OPTIONS,
-    InferencexBenchmarkResult,
+    JSON_RESULT_INDICATOR,
+    BenchmarkResultMissing,
     InferencexWorkload,
     benchmark_option_argv,
-    parse_benchmark_serving_output,
+    parse_benchmark_result_json,
 )
 from production_test_framework.workload.nccl_workload import (
     NcclTest,
@@ -43,11 +46,14 @@ from production_test_framework.workload.workload import Workload, WorkloadStatus
 def mock_inferencex_run():
     """
     Stand in for the docker run subprocess, returning a successful benchmark result.
+
+    The stdout has to be a parseable run -- indicator and JSON -- because parse_output now
+    raises on anything else, which would fail these lifecycle tests for the wrong reason.
     """
     with patch(
         "production_test_framework.workload.command_workload.run_cancellable_command",
     ) as m:
-        m.return_value = CommandResult(returncode=0, stdout="benchmark output\n", stderr="")
+        m.return_value = CommandResult(returncode=0, stdout=BENCHMARK_SERVING_OUTPUT, stderr="")
         yield m
 
 
@@ -86,34 +92,51 @@ NCCL_ALL_GATHER_OUTPUT = """\
 # Avg bus bandwidth    : 235.325
 """
 
-# Faithful to benchmark_serving.py's own print formatting (benchmark_serving.py:684-759).
-# The first value keeps its literal "{:<10}" padding, written as \x20 so linters do not
-# strip it -- real output is padded and the parser has to tolerate it.
-BENCHMARK_SERVING_OUTPUT = """\
+# A real run's JSON, as `--save-result` writes it, preceded by the summary block the script
+# still prints and the indicator the workload echoes. Note "request_goodput:" carries a trailing
+# colon in the key upstream; that is not a typo in this fixture.
+BENCHMARK_RESULT_JSON = json.dumps(
+    {
+        "date": "20260828-132824",
+        "backend": "vllm",
+        "model_id": "Qwen/Qwen3-32B",
+        "tokenizer_id": "Qwen/Qwen3-32B",
+        "best_of": 1,
+        "num_prompts": 512,
+        "request_rate": "inf",
+        "burstiness": 1.0,
+        "max_concurrency": 64,
+        "duration": 34.77475159900007,
+        "completed": 512,
+        "total_input_tokens": 262144,
+        "total_output_tokens": 65536,
+        "request_throughput": 14.723325874590067,
+        "request_goodput:": None,
+        "output_throughput": 1884.5857119475286,
+        "total_token_throughput": 9422.928559737642,
+        "mean_ttft_ms": 341.84747221679635,
+        "median_ttft_ms": 340.8126045000017,
+        "std_ttft_ms": 63.713206116146715,
+        "p90_ttft_ms": 429.54680829999467,
+        "p99_ttft_ms": 475.53700237995713,
+        "p99.9_ttft_ms": 480.6516839620159,
+        "mean_tpot_ms": 31.38726279315329,
+        "p99_tpot_ms": 32.370740385826686,
+        "mean_itl_ms": 31.387265713751834,
+        "p99_itl_ms": 45.6792856800723,
+        "mean_e2el_ms": 4328.029846947265,
+        "p99_e2el_ms": 4456.193843490014,
+    }
+)
+
+BENCHMARK_SERVING_OUTPUT = f"""\
 Starting main benchmark run...
 Traffic request rate: inf
-Maximum request concurrency: 8
 ============ Serving Benchmark Result ============
-Successful requests:                     64\x20\x20\x20\x20\x20\x20\x20\x20
-Benchmark duration (s):                  42.17
-Total input tokens:                      32768
-Total generated tokens:                  4096
-Request throughput (req/s):              1.52
-Output token throughput (tok/s):         97.13
-Total Token throughput (tok/s):          874.21
----------------Time to First Token----------------
-Mean TTFT (ms):                          128.44
-Median TTFT (ms):                        119.02
-P90 TTFT (ms):                           201.55
-P99 TTFT (ms):                           288.31
-P99.9 TTFT (ms):                         301.77
------Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          18.22
-Median TPOT (ms):                        17.90
-P90 TPOT (ms):                           22.41
-P99 TPOT (ms):                           25.03
-P99.9 TPOT (ms):                         26.10
+Successful requests:                     512
 ==================================================
+{JSON_RESULT_INDICATOR}
+{BENCHMARK_RESULT_JSON}
 """
 
 
@@ -244,9 +267,11 @@ class TestInferencexWorkload:
         with patch(
             "production_test_framework.workload.command_workload.run_cancellable_command",
         ) as m:
+            # Parseable output -- indicator and JSON. parse_output raises on anything else, which
+            # would fail these lifecycle tests for a reason they are not about.
             m.return_value = CommandResult(
                 returncode=0,
-                stdout="benchmark output\n",
+                stdout=BENCHMARK_SERVING_OUTPUT,
                 stderr="",
             )
             yield m
@@ -284,7 +309,7 @@ class TestInferencexWorkload:
         assert fut is not None
         fut.result(timeout=10.0)
         assert w.status == WorkloadStatus.COMPLETED
-        assert w.get_result().result.raw_output == "benchmark output\n"
+        assert w.get_result().result.raw_output == BENCHMARK_SERVING_OUTPUT
         assert w.get_result().status == WorkloadStatus.COMPLETED
         assert w.get_result().start_time is not None
         assert w.get_result().end_time is not None
@@ -300,10 +325,9 @@ class TestInferencexWorkload:
         w._completion_fut.result(timeout=10.0)
         cmd = mock_inferencex_run.call_args[0][0]
         assert cmd[:2] == ["docker", "run"]
-        assert "--host" in cmd
-        assert "vllm.svc" in cmd
-        assert "--port" in cmd
-        assert "9090" in cmd
+        inner = benchmark_argv(cmd)
+        assert inner[inner.index("--host") + 1] == "vllm.svc"
+        assert inner[inner.index("--port") + 1] == "9090"
         assert "--base-url" not in cmd
         w.shutdown_executor(wait=True)
 
@@ -338,7 +362,9 @@ class TestInferencexWorkload:
 
         def slow_run(*_args, **_kwargs):
             block.wait(timeout=60.0)
-            return CommandResult(returncode=0, stdout="done", stderr="")
+            # Parseable, so the run this test unblocks at the end finishes cleanly rather than
+            # raising over output this test does not care about.
+            return CommandResult(returncode=0, stdout=BENCHMARK_SERVING_OUTPUT, stderr="")
 
         mock_inferencex_run.side_effect = slow_run
         w = InferencexWorkload()
@@ -354,6 +380,17 @@ class TestInferencexWorkload:
         w.shutdown_executor(wait=True)
 
 
+def benchmark_argv(cmd: list[str]) -> list[str]:
+    """
+    The benchmark's own argv, unwrapped from the ``sh -c`` script the workload builds.
+
+    The flags are no longer separate argv elements -- they live inside a shell script so the
+    JSON result can be catted onto stdout -- so a test that wants to reason about them has to
+    unwrap it. Splits at the ``&&`` that separates the benchmark from the result-echoing tail.
+    """
+    return shlex.split(cmd[-1].split("&&")[0])
+
+
 def expected_inferencex_command(name: str) -> list[str]:
     """The full argv a default InferencexWorkload emits, for the container called *name*.
 
@@ -361,6 +398,9 @@ def expected_inferencex_command(name: str) -> list[str]:
     here changes what they run. The container name and its label are the only parts that vary
     between instances -- they are generated per run so a container left behind by an earlier
     run cannot block the next one, and so cleanup has something to remove.
+
+    The benchmark itself is wrapped in `sh -c` so the JSON written by --save-result can be
+    echoed onto stdout: that is the only channel out of a --rm container.
     """
     return [
         "docker",
@@ -374,18 +414,13 @@ def expected_inferencex_command(name: str) -> list[str]:
         "--label",
         f"{CONTAINER_LABEL}={name}",
         "openmosaic/inferencex:latest",
-        "python3",
-        "/workspace/InferenceX/utils/bench_serving/benchmark_serving.py",
-        "--host",
-        "localhost",
-        "--port",
-        "8080",
-        "--model",
-        "Qwen/Qwen3-8B",
-        "--backend",
-        "vllm",
-        "--dataset-name",
-        "random",
+        "sh",
+        "-c",
+        "python3 /workspace/InferenceX/utils/bench_serving/benchmark_serving.py "
+        "--host localhost --port 8080 --model Qwen/Qwen3-8B --backend vllm "
+        "--dataset-name random --save-result --result-dir . "
+        "--result-filename inferencex-result.json "
+        f"&& echo {JSON_RESULT_INDICATOR} && cat ./inferencex-result.json",
     ]
 
 
@@ -401,7 +436,7 @@ class TestInferencexCommand:
         assert workload.build_command() == expected_inferencex_command(workload.container_name)
 
     def test_options_layer_over_the_defaults(self):
-        cmd = InferencexWorkload(benchmark_options={"model": "other/model"}).build_command()
+        cmd = benchmark_argv(InferencexWorkload(benchmark_options={"model": "other/model"}).build_command())
         assert cmd[cmd.index("--model") + 1] == "other/model"
         assert cmd.count("--model") == 1
         # Untouched defaults survive.
@@ -409,9 +444,11 @@ class TestInferencexCommand:
 
     def test_none_drops_a_default(self):
         # This is how a disagg target replaces host/port with a single frontend URL.
-        cmd = InferencexWorkload(
-            benchmark_options={"base_url": "http://frontend.svc:8000", "host": None, "port": None}
-        ).build_command()
+        cmd = benchmark_argv(
+            InferencexWorkload(
+                benchmark_options={"base_url": "http://frontend.svc:8000", "host": None, "port": None}
+            ).build_command()
+        )
         assert cmd[cmd.index("--base-url") + 1] == "http://frontend.svc:8000"
         assert "--host" not in cmd
         assert "--port" not in cmd
@@ -463,10 +500,12 @@ class TestInferencexCommand:
         ]
 
     def test_extra_args_come_last_so_they_can_override(self):
-        cmd = InferencexWorkload(
-            benchmark_options={"num_prompts": 64},
-            benchmark_extra_args=("--num-prompts", "128"),
-        ).build_command()
+        cmd = benchmark_argv(
+            InferencexWorkload(
+                benchmark_options={"num_prompts": 64},
+                benchmark_extra_args=("--num-prompts", "128"),
+            ).build_command()
+        )
         assert cmd[-2:] == ["--num-prompts", "128"]
 
 
@@ -523,83 +562,98 @@ class TestBenchmarkOptionArgv:
         ]
 
 
-class TestBenchmarkServingOutputParsing:
-    """Tests for parsing the benchmark_serving.py summary block."""
+class TestBenchmarkResultJsonParsing:
+    """Tests for reading the --save-result JSON out of a run's stdout."""
 
     def test_parses_summary_fields(self):
-        r = parse_benchmark_serving_output(BENCHMARK_SERVING_OUTPUT)
-        assert r.successful_requests == 64
-        assert r.duration_seconds == 42.17
-        assert r.total_input_tokens == 32768
-        assert r.total_generated_tokens == 4096
-        assert r.request_throughput == 1.52
-        assert r.output_token_throughput == 97.13
-        assert r.total_token_throughput == 874.21
+        r = parse_benchmark_result_json(BENCHMARK_SERVING_OUTPUT)
+        # Several of these are spelled differently in the JSON than the property that reads
+        # them -- completed, duration, total_output_tokens, output_throughput -- so this is the
+        # regression guard on that mapping.
+        assert r.successful_requests == 512
+        assert r.duration_seconds == 34.77475159900007
+        assert r.total_input_tokens == 262144
+        assert r.total_generated_tokens == 65536
+        assert r.request_throughput == 14.723325874590067
+        assert r.output_token_throughput == 1884.5857119475286
+        assert r.total_token_throughput == 9422.928559737642
         assert r.raw_output == BENCHMARK_SERVING_OUTPUT
         assert r.passed is True
 
     def test_parses_percentile_latencies(self):
-        latency = parse_benchmark_serving_output(BENCHMARK_SERVING_OUTPUT).latency_ms
-        assert latency["mean_ttft"] == 128.44
-        assert latency["median_ttft"] == 119.02
-        assert latency["p99_ttft"] == 288.31
+        latency = parse_benchmark_result_json(BENCHMARK_SERVING_OUTPUT).latency_ms
+        assert latency["mean_ttft"] == 341.84747221679635
+        assert latency["median_ttft"] == 340.8126045000017
+        assert latency["p99_ttft"] == 475.53700237995713
         # A fractional percentile keeps its precision in the key rather than colliding with p99.
-        assert latency["p99_9_ttft"] == 301.77
-        assert latency["mean_tpot"] == 18.22
-        assert latency["p90_tpot"] == 22.41
+        assert latency["p99_9_ttft"] == 480.6516839620159
+        assert latency["mean_tpot"] == 31.38726279315329
 
-    def test_metrics_dict_exposes_raw_normalised_keys(self):
-        m = parse_benchmark_serving_output(BENCHMARK_SERVING_OUTPUT).metrics
-        assert m["successful_requests"] == 64
-        assert m["benchmark_duration_s"] == 42.17
-        assert m["total_token_throughput_tok_s"] == 874.21
-        assert m["p99_9_ttft_ms"] == 301.77
+    def test_carries_families_the_printed_block_never_had(self):
+        latency = parse_benchmark_result_json(BENCHMARK_SERVING_OUTPUT).latency_ms
+        assert latency["std_ttft"] == 63.713206116146715
+        assert latency["mean_itl"] == 31.387265713751834
+        assert latency["p99_e2el"] == 4456.193843490014
 
-    def test_unknown_summary_row_is_captured_generically(self):
-        # The whole point: a row added upstream lands in .metrics with no change to the parser.
-        output = BENCHMARK_SERVING_OUTPUT.replace(
-            "Total input tokens:",
-            "Invented Upstream Metric (widgets):      12.5\nTotal input tokens:",
-        )
-        r = parse_benchmark_serving_output(output)
+    def test_metrics_dict_exposes_normalised_json_keys(self):
+        m = parse_benchmark_result_json(BENCHMARK_SERVING_OUTPUT).metrics
+        assert m["completed"] == 512
+        assert m["duration"] == 34.77475159900007
+        assert m["total_token_throughput"] == 9422.928559737642
+        assert m["p99_9_ttft_ms"] == 480.6516839620159
+        assert m["max_concurrency"] == 64
+
+    def test_unknown_field_is_captured_generically(self):
+        # A field added upstream lands in .metrics with no change to the parser.
+        data = json.loads(BENCHMARK_RESULT_JSON)
+        data["Invented Upstream Metric (widgets)"] = 12.5
+        r = parse_benchmark_result_json(f"{JSON_RESULT_INDICATOR}\n{json.dumps(data)}")
         assert r.metrics["invented_upstream_metric_widgets"] == 12.5
-        # ...and does not disturb the rows we do name.
-        assert r.total_input_tokens == 32768
+        assert r.total_input_tokens == 262144
+
+    def test_non_numeric_fields_are_not_metrics(self):
+        m = parse_benchmark_result_json(BENCHMARK_SERVING_OUTPUT).metrics
+        for key in ("date", "backend", "model_id", "tokenizer_id", "request_rate"):
+            assert key not in m
+        # ...but they remain visible for debugging.
+        assert "Qwen/Qwen3-32B" in parse_benchmark_result_json(BENCHMARK_SERVING_OUTPUT).raw_output
 
     def test_goodput_absent_when_not_requested(self):
-        assert parse_benchmark_serving_output(BENCHMARK_SERVING_OUTPUT).request_goodput is None
+        # Null in the JSON, under a key that carries a trailing colon upstream.
+        assert parse_benchmark_result_json(BENCHMARK_SERVING_OUTPUT).request_goodput is None
 
-    def test_ignores_numeric_lines_above_the_banner(self):
-        # "Maximum request concurrency: 8" is printed before the summary and must not be read
-        # as a summary field, nor stop the real fields from parsing.
-        r = parse_benchmark_serving_output(BENCHMARK_SERVING_OUTPUT)
-        assert r.successful_requests == 64
-        assert "maximum_request_concurrency" not in r.metrics
+    def test_goodput_read_through_the_trailing_colon_key(self):
+        data = json.loads(BENCHMARK_RESULT_JSON)
+        data["request_goodput:"] = 12.25
+        r = parse_benchmark_result_json(f"{JSON_RESULT_INDICATOR}\n{json.dumps(data)}")
+        assert r.request_goodput == 12.25
 
-    def test_missing_banner_yields_empty_result(self):
-        r = parse_benchmark_serving_output("Traceback (most recent call last):\n  boom\n")
-        assert r.metrics == {}
-        assert r.successful_requests is None
-        assert r.duration_seconds is None
-        assert r.latency_ms == {}
-        assert r.passed is False
+    def test_summary_block_above_the_indicator_is_ignored(self):
+        # The printed table is still in stdout and must not be mistaken for the result.
+        r = parse_benchmark_result_json(BENCHMARK_SERVING_OUTPUT)
+        assert r.successful_requests == 512
+        assert "successful_requests" not in r.metrics
 
-    def test_truncated_block_parses_what_is_present(self):
-        truncated = BENCHMARK_SERVING_OUTPUT.split("Total input tokens")[0]
-        r = parse_benchmark_serving_output(truncated)
-        assert r.successful_requests == 64
-        assert r.duration_seconds == 42.17
-        assert r.total_input_tokens is None
+    def test_missing_indicator_raises(self):
+        with pytest.raises(BenchmarkResultMissing, match=JSON_RESULT_INDICATOR):
+            parse_benchmark_result_json("Traceback (most recent call last):\n  boom\n")
 
-    def test_empty_output_does_not_raise(self):
-        assert parse_benchmark_serving_output("") == InferencexBenchmarkResult(raw_output="")
+    def test_malformed_json_raises(self):
+        with pytest.raises(BenchmarkResultMissing, match="not valid JSON"):
+            parse_benchmark_result_json(f"{JSON_RESULT_INDICATOR}\n{{not json at all")
+
+    def test_non_object_json_raises(self):
+        with pytest.raises(BenchmarkResultMissing, match="expected a JSON object"):
+            parse_benchmark_result_json(f"{JSON_RESULT_INDICATOR}\n[1, 2, 3]")
+
+    def test_empty_output_raises(self):
+        with pytest.raises(BenchmarkResultMissing):
+            parse_benchmark_result_json("")
 
     def test_zero_completed_requests_is_not_passed(self):
-        output = BENCHMARK_SERVING_OUTPUT.replace(
-            "Successful requests:                     64",
-            "Successful requests:                     0 ",
-        )
-        r = parse_benchmark_serving_output(output)
+        data = json.loads(BENCHMARK_RESULT_JSON)
+        data["completed"] = 0
+        r = parse_benchmark_result_json(f"{JSON_RESULT_INDICATOR}\n{json.dumps(data)}")
         assert r.successful_requests == 0
         assert r.passed is False
 
@@ -922,6 +976,20 @@ class TestPromptWorkload:
         mock_cls.assert_called()
         wl.shutdown_executor(wait=True)
 
+    def test_defaults_to_the_default_model(self, mock_vllm_client_class):
+        mock_cls, _backend = mock_vllm_client_class
+        wl = PromptWorkload("q")
+        assert mock_cls.call_args[0][0].model == DEFAULT_MODEL
+        wl.shutdown_executor(wait=True)
+
+    def test_passes_model_to_vllm_client(self, mock_vllm_client_class):
+        """`start` submits `complete` with only the prompt, so the model has to travel in the
+        config or the request asks for DEFAULT_MODEL and a server serving anything else 404s."""
+        mock_cls, _backend = mock_vllm_client_class
+        wl = PromptWorkload("q", model="Qwen/Qwen3-32B")
+        assert mock_cls.call_args[0][0].model == "Qwen/Qwen3-32B"
+        wl.shutdown_executor(wait=True)
+
     def test_start_waits_for_backend_and_dispatches_completion(self, mock_vllm_client_class):
         mock_cls, backend = mock_vllm_client_class
         wl = PromptWorkload("run this")
@@ -1057,7 +1125,7 @@ class TestContainerCleanup:
         w._completion_fut.result(timeout=10.0)
 
         assert w.status == WorkloadStatus.COMPLETED
-        assert w.get_result().result.raw_output == "benchmark output\n"
+        assert w.get_result().result.raw_output == BENCHMARK_SERVING_OUTPUT
         w.shutdown_executor(wait=True)
 
 

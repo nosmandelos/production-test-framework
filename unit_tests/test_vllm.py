@@ -3,15 +3,15 @@
 
 """Unit tests for vllm module."""
 
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import requests
 
 from production_test_framework.vllm import (
-    VllmConfig,
-    VllmClient,
-    InferenceResult,
     DEFAULT_MODEL,
+    InferenceResult,
+    VllmClient,
+    VllmConfig,
 )
 
 
@@ -30,6 +30,16 @@ class TestVllmConfig:
         config = VllmConfig.from_env(host="vllm.example.com", port=8081)
         assert config.host == "vllm.example.com"
         assert config.port == 8081
+
+    def test_model_defaults(self):
+        assert VllmConfig().model == DEFAULT_MODEL
+
+    def test_model_custom(self):
+        assert VllmConfig(model="Qwen/Qwen3-32B").model == "Qwen/Qwen3-32B"
+
+    def test_from_env_carries_model(self):
+        config = VllmConfig.from_env(host="vllm", port=8081, model="Qwen/Qwen3-32B")
+        assert config.model == "Qwen/Qwen3-32B"
 
 
 class TestInferenceResult:
@@ -103,6 +113,33 @@ class TestVllmClient:
         assert call_payload["prompt"] == "Hello"
         assert call_payload["max_tokens"] == 10
         assert call_payload["model"] == DEFAULT_MODEL
+        assert result.model == DEFAULT_MODEL
+
+    @patch("production_test_framework.vllm.requests.post")
+    def test_complete_uses_configured_model(self, mock_post):
+        """A server serving something other than DEFAULT_MODEL 404s unless the config reaches
+        the request. This is the case that pinned every caller to Qwen3-8B."""
+        mock_post.return_value = MagicMock(
+            status_code=200,
+            json=MagicMock(return_value={"choices": [{"text": " ok", "finish_reason": "stop"}], "usage": {}}),
+        )
+        client = VllmClient(VllmConfig(model="Qwen/Qwen3-32B"))
+        result = client.complete("Hello")
+
+        assert mock_post.call_args[1]["json"]["model"] == "Qwen/Qwen3-32B"
+        assert result.model == "Qwen/Qwen3-32B"
+
+    @patch("production_test_framework.vllm.requests.post")
+    def test_complete_argument_overrides_configured_model(self, mock_post):
+        mock_post.return_value = MagicMock(
+            status_code=200,
+            json=MagicMock(return_value={"choices": [{"text": " ok", "finish_reason": "stop"}], "usage": {}}),
+        )
+        client = VllmClient(VllmConfig(model="Qwen/Qwen3-32B"))
+        result = client.complete("Hello", model="Qwen/Qwen3-8B")
+
+        assert mock_post.call_args[1]["json"]["model"] == "Qwen/Qwen3-8B"
+        assert result.model == "Qwen/Qwen3-8B"
 
     @patch("production_test_framework.vllm.requests.post")
     def test_complete_http_error(self, mock_post):

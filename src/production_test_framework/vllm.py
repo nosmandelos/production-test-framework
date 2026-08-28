@@ -9,10 +9,8 @@ Provides a reusable client for vLLM inference.
 
 import time
 from dataclasses import dataclass, field
-from typing import Optional, Dict
 
 import requests
-
 
 DEFAULT_MODEL = "Qwen/Qwen3-8B"
 
@@ -25,6 +23,11 @@ class VllmConfig:
     port: int = 8080
     timeout: int = 600  # Longer timeout for inference
     health_timeout: int = 10
+    # The model every request asks for unless it names one itself. vLLM answers 404 for any
+    # name it is not serving, so a caller driving a server that serves something other than
+    # DEFAULT_MODEL has to state it -- and stating it here rather than per call is what reaches
+    # the deferred requests, such as PromptWorkload's.
+    model: str = DEFAULT_MODEL
 
     @property
     def base_url(self) -> str:
@@ -32,9 +35,9 @@ class VllmConfig:
         return f"http://{self.host}:{self.port}"
 
     @classmethod
-    def from_env(cls, host: str = "localhost", port: int = 8080) -> "VllmConfig":
-        """Create configuration with specified host and port."""
-        return cls(host=host, port=port)
+    def from_env(cls, host: str = "localhost", port: int = 8080, model: str = DEFAULT_MODEL) -> VllmConfig:
+        """Create configuration with specified host, port and model."""
+        return cls(host=host, port=port, model=model)
 
 
 @dataclass
@@ -44,9 +47,9 @@ class InferenceResult:
     success: bool
     text: str = ""
     model: str = ""
-    usage: Dict[str, int] = field(default_factory=dict)
+    usage: dict[str, int] = field(default_factory=dict)
     finish_reason: str = ""
-    error: Optional[str] = None
+    error: str | None = None
     response_time: float = 0.0
 
 
@@ -57,7 +60,7 @@ class VllmClient:
     Provides methods for health check and inference.
     """
 
-    def __init__(self, config: Optional[VllmConfig] = None):
+    def __init__(self, config: VllmConfig | None = None):
         """
         Initialize vLLM client.
 
@@ -116,7 +119,7 @@ class VllmClient:
     def complete(
         self,
         prompt: str,
-        model: str = DEFAULT_MODEL,
+        model: str | None = None,
         max_tokens: int = 100,
         temperature: float = 0.9,
     ) -> InferenceResult:
@@ -125,13 +128,15 @@ class VllmClient:
 
         Args:
             prompt: Input prompt text
-            model: Model name (default: DEFAULT_MODEL)
+            model: Model name; defaults to the configured model, itself DEFAULT_MODEL
             max_tokens: Maximum tokens to generate (default: 100)
             temperature: Sampling temperature (default: 0.9)
 
         Returns:
             InferenceResult with generated text and metadata.
         """
+        model = model or self.config.model
+
         payload = {
             "model": model,
             "prompt": prompt,

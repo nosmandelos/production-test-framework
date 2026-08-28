@@ -6,7 +6,7 @@ import time
 from concurrent.futures import CancelledError, Future
 from enum import Enum
 
-from production_test_framework.vllm import VllmClient, VllmConfig
+from production_test_framework.vllm import DEFAULT_MODEL, VllmClient, VllmConfig
 from production_test_framework.workload.workload import Workload, WorkloadResult, WorkloadStatus
 
 
@@ -21,7 +21,11 @@ class PromptWorkload(Workload):
         backend_type: BACKEND_TYPE = BACKEND_TYPE.VLLM,
         host: str = "localhost",
         port: int = 8080,
+        model: str = DEFAULT_MODEL,
     ):
+        """
+        Send one prompt to a backend and hold the result.
+        """
         super().__init__()
         self.logger = logging.getLogger(__name__)
         self.prompt = prompt
@@ -32,7 +36,7 @@ class PromptWorkload(Workload):
 
         match backend_type:
             case BACKEND_TYPE.VLLM:
-                self.backend = VllmClient(VllmConfig(host=host, port=port))
+                self.backend = VllmClient(VllmConfig(host=host, port=port, model=model))
 
     @property
     def status(self) -> WorkloadStatus:
