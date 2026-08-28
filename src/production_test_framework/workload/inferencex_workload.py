@@ -3,13 +3,15 @@
 
 """
 InferenceX benchmark workload: runs ``benchmark_serving.py`` in a container via ``docker run``
-and parses the "Serving Benchmark Result" block it prints.
+and reads the JSON result it writes with ``--save-result``.
 
 The workload is a pure client -- it drives load against an already-running deployment and never
 launches a server.
 """
 
+import json
 import re
+import shlex
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -20,15 +22,27 @@ from production_test_framework.workload.docker_mixin import DockerContainerMixin
 
 __all__ = [
     "DEFAULT_BENCHMARK_OPTIONS",
+    "JSON_RESULT_INDICATOR",
     "BenchmarkCancelled",
+    "BenchmarkResultMissing",
     "InferencexBenchmarkResult",
     "InferencexWorkload",
     "WorkloadCancelled",
     "benchmark_option_argv",
-    "parse_benchmark_serving_output",
+    "parse_benchmark_result_json",
 ]
 
 BenchmarkCancelled = WorkloadCancelled
+
+
+class BenchmarkResultMissing(RuntimeError):
+    """Raised when a run's stdout carries no usable JSON result."""
+
+
+# Printed immediately before the JSON so the split point is explicit rather than inferred by
+# hunting for the last "{" in a stream that also contains a summary table and any warnings the
+# script emitted.
+JSON_RESULT_INDICATOR = "---INFERENCEX-RESULT-JSON---"
 
 # Applied under whatever the caller passes, so a bare InferencexWorkload() still targets the
 # usual single-node vLLM stack. This is data, not logic -- the class attaches no meaning to
@@ -43,17 +57,21 @@ DEFAULT_BENCHMARK_OPTIONS: Mapping[str, Any] = {
     "model": "Qwen/Qwen3-8B",
     "backend": "vllm",
     "dataset_name": "random",
+    "save_result": True,
+    "result_dir": ".",
+    "result_filename": "inferencex-result.json",
 }
 
 
 @dataclass
 class InferencexBenchmarkResult:
     """
-    Parsed "Serving Benchmark Result" block from a ``benchmark_serving.py`` run.
+    Parsed JSON result of a ``benchmark_serving.py`` run.
 
-    Every ``Label: <number>`` row in the block lands in :attr:`metrics` under a normalised key,
-    so rows added upstream are captured without a change here. The properties below name the
-    rows we actually assert on; they are conveniences over the same dict.
+    Every numeric field lands in :attr:`metrics` under a normalised key, so a field added
+    upstream is captured without a change here. The properties below name the ones we actually
+    assert on and are conveniences over the same dict; several of them differ from the JSON's own
+    spelling, which is why they exist at all.
     """
 
     metrics: dict[str, float] = field(default_factory=dict)
@@ -65,7 +83,7 @@ class InferencexBenchmarkResult:
 
     @property
     def successful_requests(self) -> int | None:
-        return self._int("successful_requests")
+        return self._int("completed")
 
     @property
     def total_input_tokens(self) -> int | None:
@@ -73,31 +91,37 @@ class InferencexBenchmarkResult:
 
     @property
     def total_generated_tokens(self) -> int | None:
-        return self._int("total_generated_tokens")
+        return self._int("total_output_tokens")
 
     @property
     def duration_seconds(self) -> float | None:
-        return self.metrics.get("benchmark_duration_s")
+        return self.metrics.get("duration")
 
     @property
     def request_throughput(self) -> float | None:
         """Requests per second."""
-        return self.metrics.get("request_throughput_req_s")
+        return self.metrics.get("request_throughput")
 
     @property
     def request_goodput(self) -> float | None:
-        """Requests per second meeting the SLOs -- only present when goodput was requested."""
-        return self.metrics.get("request_goodput_req_s")
+        """
+        Requests per second meeting the SLOs -- only present when goodput was requested.
+
+        The JSON spells this key ``"request_goodput:"``, trailing colon included; :func:`_metric_key`
+        strips it. Do not "fix" that by matching ``request_goodput`` upstream without checking, or
+        this silently reads ``None`` forever.
+        """
+        return self.metrics.get("request_goodput")
 
     @property
     def output_token_throughput(self) -> float | None:
         """Generated tokens per second."""
-        return self.metrics.get("output_token_throughput_tok_s")
+        return self.metrics.get("output_throughput")
 
     @property
     def total_token_throughput(self) -> float | None:
         """Input plus generated tokens per second."""
-        return self.metrics.get("total_token_throughput_tok_s")
+        return self.metrics.get("total_token_throughput")
 
     @property
     def latency_ms(self) -> dict[str, float]:
@@ -112,54 +136,55 @@ class InferencexBenchmarkResult:
         return bool(self.successful_requests)
 
 
-_RESULT_BANNER = "Serving Benchmark Result"
-
-# Summary lines are printed as "{:<40} {:<10}" pairs, so a label runs up to the first colon and
-# the value is the bare number after it. Lines whose value is not numeric (e.g. "request rate:
-# inf") simply do not match and are skipped.
-_SUMMARY_LINE_RE = re.compile(r"^(?P<label>\S[^:]*):\s+(?P<value>-?[\d.]+)\s*$")
-
-
-def _to_float(value: str) -> float | None:
-    try:
-        return float(value)
-    except ValueError:
-        return None
-
-
 def _metric_key(label: str) -> str:
     """
-    Normalise a summary label into a dict key.
+    Normalise a JSON field name into a dict key.
 
-    ``"Successful requests"`` -> ``"successful_requests"``,
-    ``"Total Token throughput (tok/s)"`` -> ``"total_token_throughput_tok_s"``,
-    ``"P99.9 TTFT (ms)"`` -> ``"p99_9_ttft_ms"``.
+    ``"p99.9_ttft_ms"`` -> ``"p99_9_ttft_ms"`` (a fractional percentile keeps its precision
+    rather than colliding with ``p99``), and ``"request_goodput:"`` -> ``"request_goodput"``,
+    dropping the trailing colon that field carries upstream.
     """
     return re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
 
 
-def parse_benchmark_serving_output(output: str) -> InferencexBenchmarkResult:
+def parse_benchmark_result_json(output: str) -> InferencexBenchmarkResult:
     """
-    Parse the summary block ``benchmark_serving.py`` prints when a run finishes.
+    Read the JSON result out of a run's stdout.
+
+    The run appends :data:`JSON_RESULT_INDICATOR` and then the file written by ``--save-result``, so
+    everything after the last indicator is the result object.
+
+    Raises :class:`BenchmarkResultMissing` when the indicator is absent, when what follows it is not
+    valid JSON, or when it is not an object.
+
     """
+    _, indicator, payload = output.rpartition(JSON_RESULT_INDICATOR)
+    if not indicator:
+        raise BenchmarkResultMissing(
+            f"no {JSON_RESULT_INDICATOR} in the benchmark output, so it wrote no JSON result. "
+            "Was save_result turned off, or did the run fail before writing it? "
+            "The full output is on the workload's command_result."
+        )
+
+    try:
+        data = json.loads(payload)
+    except ValueError as exc:
+        raise BenchmarkResultMissing(
+            f"the text after {JSON_RESULT_INDICATOR} is not valid JSON: {exc}. "
+            "The full output is on the workload's command_result."
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise BenchmarkResultMissing(
+            f"expected a JSON object after {JSON_RESULT_INDICATOR}, got {type(data).__name__}."
+        )
+
     result = InferencexBenchmarkResult(raw_output=output)
-
-    lines = output.splitlines()
-    for index, line in enumerate(lines):
-        if _RESULT_BANNER in line:
-            lines = lines[index + 1 :]
-            break
-    else:
-        return result
-
-    for line in lines:
-        match = _SUMMARY_LINE_RE.match(line.strip())
-        if match is None:
+    for name, value in data.items():
+        # bool is an int subclass, and a flag recorded in the result is not a measurement.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
             continue
-        value = _to_float(match.group("value"))
-        if value is not None:
-            result.metrics[_metric_key(match.group("label"))] = value
-
+        result.metrics[_metric_key(name)] = float(value)
     return result
 
 
@@ -259,13 +284,29 @@ class InferencexWorkload(DockerContainerMixin, CommandWorkload):
             *self._benchmark_extra_args,
         ]
 
+    def _result_path(self) -> str | None:
+        """Where ``--save-result`` will write, or None when the caller turned it off."""
+        options = self._benchmark_options
+        if not options.get("save_result"):
+            return None
+        filename = options.get("result_filename")
+        if not filename:
+            return None
+        directory = options.get("result_dir")
+        return f"{directory}/{filename}" if directory else str(filename)
+
     def build_command(self) -> list[str]:
         # --network host is what lets a host/port endpoint reach a server published on the
         # host; everything else about the docker invocation is the base class's.
-        return [*self.docker_run_argv("--network", "host"), *self._benchmark_inner_argv()]
+        inner = self._benchmark_inner_argv()
+        path = self._result_path()
+        if path is not None:
+            script = f"{shlex.join(inner)} && echo {shlex.quote(JSON_RESULT_INDICATOR)} && cat {shlex.quote(path)}"
+            inner = ["sh", "-c", script]
+        return [*self.docker_run_argv("--network", "host"), *inner]
 
     def parse_output(self, result: CommandResult) -> InferencexBenchmarkResult:
-        return parse_benchmark_serving_output(result.stdout)
+        return parse_benchmark_result_json(result.stdout)
 
     def _empty_result(self) -> InferencexBenchmarkResult | None:
         return None
