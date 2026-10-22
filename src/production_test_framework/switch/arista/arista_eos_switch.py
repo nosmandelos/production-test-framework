@@ -27,6 +27,7 @@ from pyeapi.eapilib import CommandError
 from pyeapi.eapilib import ConnectionError as EapiConnectionError
 
 from production_test_framework.switch.exceptions import SwitchAPIError
+from production_test_framework.switch.mac import normalize_mac
 from production_test_framework.switch.models import (
     FlowControl,
     LldpNeighbor,
@@ -243,7 +244,7 @@ class AristaEosSwitch(NetworkSwitch):
                 port_id = info.get("interfaceId", "")
                 if not isinstance(port_id, str):
                     continue
-                mac = self._normalize_mac(port_id.replace('"', ""))
+                mac = normalize_mac(port_id.replace('"', ""))
                 if not mac:
                     # A non-MAC port id (e.g. an interface name) is expected; skip it.
                     if info.get("interfaceIdType") == "macAddress":
@@ -271,7 +272,7 @@ class AristaEosSwitch(NetworkSwitch):
         table: list[MacEntry] = []
         for entry in entries:
             interface = entry.get("interface", "")
-            mac = self._normalize_mac(entry.get("macAddress", ""))
+            mac = normalize_mac(entry.get("macAddress", ""))
             if not interface or not mac:
                 continue
             table.append(
@@ -293,13 +294,6 @@ class AristaEosSwitch(NetworkSwitch):
             self._logger.debug(f"port names: breakout shifts port ids from cage numbers: {port_names.mapping()}")
         return port_names
 
-    @staticmethod
-    def _normalize_mac(value: str) -> str:
-        """Normalize a MAC (dotted "001c.7300.abcd" or colon form) to lowercase colon form, or "" if invalid."""
-        compact = value.replace(".", "").replace(":", "").lower()
-        if len(compact) != 12:
-            return ""
-        return ":".join(compact[i : i + 2] for i in range(0, 12, 2))
 
     def _parse_system_status(self, version: dict[str, Any], hostname: dict[str, Any]) -> NetworkSwitchStatus:
         uptime = version.get("uptime")

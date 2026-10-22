@@ -13,6 +13,7 @@ from requests.auth import HTTPBasicAuth
 from urllib3.util.retry import Retry
 
 from production_test_framework.switch.exceptions import SwitchAPIError
+from production_test_framework.switch.mac import normalize_mac
 from production_test_framework.switch.models import (
     FlowControl,
     LldpNeighbor,
@@ -475,7 +476,7 @@ class NvidiaCumulusSwitch(NetworkSwitch):
                 port_name = port_obj.get("name")
                 if not isinstance(port_name, str):
                     continue
-                mac = self._normalize_mac(port_name)
+                mac = normalize_mac(port_name)
                 if not mac:
                     self._logger.warning(f"lldp_neighbors: invalid MAC {port_name!r} on {interface_id}")
                     continue
@@ -497,13 +498,6 @@ class NvidiaCumulusSwitch(NetworkSwitch):
             self._logger.debug(f"port names: breakout shifts port ids from cage numbers: {port_names.mapping()}")
         return port_names
 
-    @staticmethod
-    def _normalize_mac(value: str) -> str:
-        """Normalize a MAC (with or without colons) to lowercase colon form, or "" if invalid."""
-        compact = value.replace(":", "").lower()
-        if len(compact) != 12:
-            return ""
-        return ":".join(compact[i : i + 2] for i in range(0, 12, 2))
 
     def _parse_system_status(self, system: dict, platform: dict, firmware: dict) -> NetworkSwitchStatus:
         return NetworkSwitchStatus(
