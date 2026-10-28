@@ -14,9 +14,13 @@ Only the commands backing the ``NetworkSwitch`` interface are wrapped:
     flow_control          -> not supported yet, raises NotImplementedError
     set_port_admin_state  -> interface <id> ; [no] shutdown
     delete_vlan           -> no vlan <id>
+    port_fec              -> show running-config interface <id>
+    set_port_fec          -> interface <id> ; fec <mode> / no fec
+    svi_address           -> show running-config interface vlan<id>
+    set_svi_address       -> interface vlan<id> ; ip[v6] address ... / no interface vlan<id>
 
-Requires NX-API enabled on the switch (``feature nxapi``), and ``feature lldp``
-for lldp_neighbors.
+Requires NX-API enabled on the switch (``feature nxapi``), ``feature lldp`` for
+lldp_neighbors and ``feature interface-vlan`` for SVIs.
 """
 
 import logging
@@ -28,6 +32,7 @@ from requests.auth import HTTPBasicAuth
 from production_test_framework.switch.exceptions import SwitchAPIError
 from production_test_framework.switch.mac import normalize_mac
 from production_test_framework.switch.models import (
+    FecEncoding,
     FlowControl,
     LldpNeighbor,
     MacEntry,
@@ -35,15 +40,31 @@ from production_test_framework.switch.models import (
     NetworkSwitchStatus,
     Port,
     PortBridge,
+    SviAddress,
     Vlan,
 )
-from production_test_framework.switch.network_switch import NetworkSwitch
+from production_test_framework.switch.network_switch import (
+    NetworkSwitch,
+    parse_svi_address,
+    svi_address_from_config,
+)
 from production_test_framework.switch.port_sort import cisco_port_id_sort_key
 from production_test_framework.switch.portname import PortNameResolver, parse_cisco
 
 requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
 
 _TIMEOUT_S = 60
+
+# NX-OS's FEC modes as its running config shows them. The CLI takes "rs-fec" for
+# Reed-Solomon at any speed; "kp-fec" (RS(544)) is a DME value the CLI refuses.
+_FEC_MODES = {
+    "off": FecEncoding.OFF,
+    "fc-fec": FecEncoding.FIRE_CODE,
+    "rs-fec": FecEncoding.REED_SOLOMON,
+    "kp-fec": FecEncoding.REED_SOLOMON,
+    "rs-ieee": FecEncoding.REED_SOLOMON,
+    "rs-cons16": FecEncoding.REED_SOLOMON,
+}
 
 
 class CiscoNxosSwitch(NetworkSwitch):
@@ -128,12 +149,66 @@ class CiscoNxosSwitch(NetworkSwitch):
         """Remove a VLAN from the switch."""
         self._run_config([f"no vlan {vlan_id}"])
 
+    def port_fec(self, port_id: str) -> FecEncoding | None:
+        """The port's FEC from its running config; no fec line (or fec auto) is the switch's choice."""
+        for line in self._run_text(f"show running-config interface {port_id}").splitlines():
+            fields = line.split()
+            if len(fields) == 2 and fields[0] == "fec":
+                if fields[1] == "auto":
+                    return None
+                if fields[1] not in _FEC_MODES:
+                    raise SwitchAPIError(f"port {port_id}: unknown FEC mode {fields[1]!r}")
+                return _FEC_MODES[fields[1]]
+        return None
+
+    def set_port_fec(self, port_id: str, fec: FecEncoding | None) -> None:
+        """Set the port's FEC; None returns it to auto, the switch's choice."""
+        match fec:
+            case None:
+                command = "no fec"
+            case FecEncoding.OFF:
+                command = "fec off"
+            case FecEncoding.FIRE_CODE:
+                command = "fec fc-fec"
+            case FecEncoding.REED_SOLOMON:
+                command = "fec rs-fec"
+            case _:
+                raise ValueError(f"unsupported FEC {fec!r}")
+        self._run_config([f"interface {port_id}", command])
+
+    def svi_address(self, vlan_id: str) -> SviAddress | None:
+        """The SVI's address from its running config. NX-OS refuses to show an SVI that doesn't exist."""
+        try:
+            config = self._run_text(f"show running-config interface vlan{vlan_id}")
+        except SwitchAPIError as exc:
+            if "Invalid range" in str(exc):
+                return None
+            raise
+        return svi_address_from_config(config)
+
+    def set_svi_address(self, vlan_id: str, address: SviAddress | str | None) -> None:
+        """Make address the SVI's only address, or remove the SVI for None."""
+        if address is None:
+            self._run_config([f"no interface vlan{vlan_id}"])
+            return
+        address = parse_svi_address(address)
+        family = "ip" if address.version == 4 else "ipv6"
+        self._run_config(
+            [
+                f"interface vlan{vlan_id}",
+                "no ip address",
+                "no ipv6 address",
+                f"{family} address {address.with_prefixlen}",
+            ]
+        )
+
     # --- NX-API plumbing -----------------------------------------------------
 
-    def _call(self, command: str) -> dict[str, Any]:
-        """One JSON-RPC "cli" request. Several commands go in one request separated
-        by " ; ", and the switch runs them in order."""
-        payload = {"jsonrpc": "2.0", "method": "cli", "params": {"cmd": command, "version": 1}, "id": 1}
+    def _call(self, command: str, method: str = "cli") -> dict[str, Any]:
+        """One JSON-RPC request: "cli" for structured output, "cli_ascii" for text.
+        Several commands go in one request separated by " ; ", and the switch runs
+        them in order."""
+        payload = {"jsonrpc": "2.0", "method": method, "params": {"cmd": command, "version": 1}, "id": 1}
         self._logger.debug(f"NX-API: {command}")
         try:
             response = self._session.post(
@@ -170,6 +245,14 @@ class CiscoNxosSwitch(NetworkSwitch):
         result = self._call(command).get("result")
         body = result.get("body") if isinstance(result, dict) else None
         return body if isinstance(body, dict) else {}
+
+    def _run_text(self, command: str) -> str:
+        """A show command's text, for what NX-API has no structured form of (the running config)."""
+        result = self._call(command, method="cli_ascii").get("result")
+        msg = result.get("msg") if isinstance(result, dict) else None
+        if not isinstance(msg, str):
+            raise SwitchAPIError(f"unexpected NX-API response for {command!r}: {result!r}")
+        return msg
 
     def _run_config(self, commands: list[str]) -> None:
         self._call(" ; ".join(["configure terminal", *commands]))
@@ -301,4 +384,3 @@ def _full_name(name: str) -> str:
     if name.startswith("Eth") and not name.startswith("Ethernet"):
         return "Ethernet" + name[len("Eth") :]
     return name
-
